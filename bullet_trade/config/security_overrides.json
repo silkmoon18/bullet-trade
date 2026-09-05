@@ -98,6 +98,7 @@
     
     "511880.XSHG": { "name": "银华日利ETF", "category": "money_market_fund", "tplus": 0, "slippage": 0.0 },
     
+    "520890.XSHG": { "name": "港股通红利低波ETF", "category": "fund", "tplus": 0 },
     "513030.XSHG": { "name": "德国DAX30ETF", "category": "fund", "tplus": 0 },
     "513050.XSHG": { "name": "中概互联网ETF", "category": "fund", "tplus": 0 },
     "510900.XSHG": { "name": "H股ETF", "category": "fund", "tplus": 0 },

@@ -439,6 +439,14 @@ def reset_security_overrides() -> None:
     _security_info_cache.clear()
 
 
+def get_security_tplus_override(security: str) -> Optional[int]:
+    """仅返回代码级结算周期；不能把 fund 类默认 T+0 用于真实账本。"""
+    _load_security_overrides_if_needed()
+    entry = (_security_overrides.get("by_code") or {}).get(security) or {}
+    value = entry.get("tplus")
+    return value if type(value) is int and value in (0, 1) else None
+
+
 def _merge_overrides(security: str, base_info: Dict[str, Any]) -> Dict[str, Any]:
     """将配置覆盖项合并到基础元信息中。支持分类默认与按代码覆盖。"""
     _load_security_overrides_if_needed()

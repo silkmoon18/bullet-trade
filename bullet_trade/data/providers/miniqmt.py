@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from datetime import date as Date
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Set, Union
@@ -81,6 +82,7 @@ class MiniQMTProvider(DataProvider):
         self._tick_metadata: Dict[str, Dict[str, Any]] = {}
         self._t0_funds_cache_day: Optional[Date] = None
         self._t0_funds: Set[str] = set()
+        self._t0_funds_retry_at = 0.0
 
     # ------------------------ 工具函数 ------------------------
     @staticmethod
@@ -480,16 +482,24 @@ class MiniQMTProvider(DataProvider):
         return metadata
 
     def get_tplus(self, security: str) -> int:
-        """Resolve fund settlement from QMT's official ``T+0基金`` sector.
+        """Resolve settlement from explicit code overrides or QMT's T+0 sector.
 
-        Missing or unavailable sector data falls back to T+1. This is safer
-        for a strategy-owned ledger than consuming another owner's physically
-        sellable position in a shared account.
+        Unknown instruments remain T+1. Empty/unavailable sector data is retried
+        after one minute, rather than cached as a successful result all day.
+        Category/prefix defaults and the broker's total sellable position are
+        deliberately not used to infer ownership or same-day trading rights.
         """
+        from ..api import get_security_tplus_override
 
         qmt_security = self._normalize_security_code(security)
-        if self._t0_funds_cache_day != Date.today():
-            self._t0_funds_cache_day = Date.today()
+        override = get_security_tplus_override(self._to_jq_code(qmt_security))
+        if override is not None:
+            return override
+        today = Date.today()
+        if (
+            self._t0_funds_cache_day != today
+            and time.monotonic() >= self._t0_funds_retry_at
+        ):
             self._t0_funds = set()
             try:
                 xt = self._ensure_xtdata()
@@ -499,8 +509,15 @@ class MiniQMTProvider(DataProvider):
                     for item in (values or ())
                     if str(item).strip()
                 }
+                if not self._t0_funds:
+                    raise ValueError("T+0基金板块为空或当前QMT版本未提供")
+                self._t0_funds_cache_day = today
             except Exception as exc:
-                logger.warning("MiniQMT读取T+0基金板块失败，保守按T+1: %s", exc)
+                self._t0_funds_retry_at = time.monotonic() + 60.0
+                logger.warning(
+                    "MiniQMT读取T+0基金板块失败；无代码级配置的标的暂按T+1，"
+                    "60秒后可重试: %s", exc
+                )
         return 0 if qmt_security in self._t0_funds else 1
 
     @classmethod

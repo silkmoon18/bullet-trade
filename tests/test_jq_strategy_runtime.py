@@ -136,6 +136,11 @@ def test_public_contract_exports_and_constants(helper):
 
 def test_public_hong_kong_etf_filter_supports_defaults_and_overrides(helper):
     assert helper.is_hong_kong_etf("520590.XSHG", "恒科") is True
+    assert helper.is_hong_kong_etf("520890.XSHG", "港红利") is True
+    assert helper.is_hong_kong_etf("520890.XSHG", "") is True
+    assert helper.is_hong_kong_etf("520999.XSHG", "港红利ETF") is True
+    assert helper.is_hong_kong_etf("510002.XSHG", "港口航运ETF") is False
+    assert helper.is_hong_kong_etf("510003.XSHG", "红利ETF") is False
     assert helper.is_hong_kong_etf(
         "510001.XSHG", "科技ETF", "恒生科技指数"
     ) is True

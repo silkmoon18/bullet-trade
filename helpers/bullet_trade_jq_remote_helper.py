@@ -96,8 +96,9 @@ HONG_KONG_ETF_KEYWORDS = (
     "港股通",
     "沪港深",
     "恒科",
+    "港红利",
 )
-HONG_KONG_ETF_CODE_DENYLIST = frozenset({"520590.XSHG"})
+HONG_KONG_ETF_CODE_DENYLIST = frozenset({"520590.XSHG", "520890.XSHG"})
 
 DEFAULT_RPC_TIMEOUT_SECONDS = 60.0
 _RPC_ATTEMPTS = 3

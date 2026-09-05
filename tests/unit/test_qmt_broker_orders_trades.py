@@ -55,6 +55,37 @@ def test_qmt_broker_get_trades_mapping(monkeypatch):
 
 
 @pytest.mark.unit
+def test_native_zero_sell_price_is_not_fabricated_from_quote_or_cost():
+    from bullet_trade.server.strategy.broker_contract import (
+        BrokerContractError, normalize_trade_evidence, UnpricedFillPolicy,
+    )
+
+    # The September 4 simulator response had both native fields equal to zero.
+    row = QmtBroker(account_id="demo").normalize_trade_event({
+        "traded_id": "sell-zero", "order_id": "sell-order",
+        "stock_code": "560210.SH", "order_type": 24,
+        "traded_volume": 100, "traded_price": 0, "traded_amount": 0,
+        "traded_time": "2026-09-04 09:30:11",
+        "last_price": 1.2, "open_price": 1.1,
+    })
+    assert row["price"] == 0
+    assert row["deal_balance"] == 0
+    assert row["commission_known"] is False
+    orders = {"sell-order": {
+        "amount": 100, "filled": 100, "is_buy": False,
+        "order_price": 1.0, "price": 0,
+    }}
+    with pytest.raises(BrokerContractError, match="price is invalid"):
+        normalize_trade_evidence(row, orders)
+    evidence = normalize_trade_evidence(
+        row, orders, UnpricedFillPolicy.CONSERVATIVE_ORDER_PRICE,
+    )
+    assert evidence.price_known is False
+    assert evidence.commission_units is None
+    assert evidence.tax_units is None
+
+
+@pytest.mark.unit
 def test_qmt_broker_get_trades_prefers_traded_price_and_preserves_zero_commission(monkeypatch):
     broker = QmtBroker(account_id="demo")
     broker._connected = True

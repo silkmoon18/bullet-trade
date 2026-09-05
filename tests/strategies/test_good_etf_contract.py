@@ -347,6 +347,57 @@ def test_good_etf_uses_public_hong_kong_etf_filter(monkeypatch):
     ) is False
 
 
+def test_hk_short_name_fix_preserves_remaining_filters_ranking_and_weights(monkeypatch):
+    strategy = _load_strategy(monkeypatch)
+    runtime = _Runtime(real_helper.RuntimeMode.JQ)
+    strategy._runtime = runtime
+    codes = ["520890.XSHG", "510001.XSHG", "510002.XSHG", "510003.XSHG", "510004.XSHG"]
+    names = ["港红利", "港口航运ETF", "红利ETF", "科技ETF", "低流动性ETF"]
+    context = types.SimpleNamespace(
+        previous_date=pd.Timestamp("2026-09-03").date(),
+        current_dt=pd.Timestamp("2026-09-04 09:30:00"),
+    )
+
+    def securities(types_, date):
+        assert types_ == ["etf"] and date == context.previous_date
+        return pd.DataFrame({"display_name": names}, index=codes)
+
+    def history(count, unit, field, security_list):
+        assert count == 1 and unit == "1d"
+        assert security_list == codes[1:]
+        values = [1e7, 1e7, 1e7, 1e6] if field == "money" else [2.0] * 4
+        return pd.DataFrame([values], columns=security_list)
+
+    def extras(field, security_list, end_date, df, count):
+        assert field == "unit_net_value" and end_date == context.previous_date
+        assert security_list == codes[1:4] and df and count == 1
+        return pd.DataFrame([[2.0] * 3], columns=security_list)
+
+    monkeypatch.setattr(strategy, "get_all_securities", securities, raising=False)
+    monkeypatch.setattr(strategy, "history", history, raising=False)
+    monkeypatch.setattr(strategy, "get_extras", extras, raising=False)
+    # Missing index metadata is precisely when the short-name fallback matters.
+    monkeypatch.setattr(strategy, "finance", None)
+    prices = dict(zip(codes[1:4], [1.0, 1.5, 1.8]))
+    monkeypatch.setattr(strategy, "get_current_data", lambda: {
+        code: types.SimpleNamespace(last_price=price, paused=False, high_limit=3.0)
+        for code, price in prices.items()
+    }, raising=False)
+
+    strategy.before_market_open(context)
+    assert strategy.g.fund_list.index.tolist() == codes[1:4]
+    strategy.market_open(context)
+    assert len(runtime.rebalances) == 1
+    _, weights, marks, _, _ = runtime.rebalances[0]
+    premiums = [abs(price / 2.0 - 1) * 100 for price in prices.values()]
+    assert list(weights) == codes[1:4]
+    assert weights == {
+        code: value / sum(premiums) * 0.95
+        for code, value in zip(codes[1:4], premiums)
+    }
+    assert marks == prices
+
+
 def test_lifecycle_installs_runtime_before_platform_calls():
     tree = ast.parse(
         STRATEGY_PATH.read_text(encoding="utf-8"),
