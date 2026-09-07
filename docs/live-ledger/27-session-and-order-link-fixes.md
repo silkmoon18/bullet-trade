@@ -43,8 +43,22 @@
 
 ## 部署边界
 
-本轮只完成本地实现和测试，尚未推送或部署；不代表服务器对账已恢复，也未进行真实QMT下单验证。没有修改交易开关、白名单、账户数据或旧上游目录。
+实现验收阶段只完成本地修改和测试，当时未推送或部署；随后按用户“部署”指令执行，结果见下。整个过程不主动下单/撤单，也不修改交易开关或白名单。
 
 下一次部署仅需更新服务器fork，不需要因本次变更重新上传聚宽策略/helper/config。应在停服后备份`.data`中的账本及配置，再升级到v11；降级不能只回退代码，需使用匹配的数据库备份。部署后只读核对同日冲突委托和原成交关联、对账状态，并确认盘后没有新增订单；不得通过改写旧成交或伪造回报让验收通过。
 
 此前已经混合或丢失的历史缓存字段不能靠v11迁移凭空恢复。新关联规则可修正“现有成交被指向新订单”的计算路径，但剩余历史数据是否足够，仍须部署后用服务器实际快照验证。
+
+## 2026-09-07部署结果
+
+- 代码提交`a465f68`已推送到个人fork的`codex/joinquant-execution-modes`分支；服务器目录`C:\Users\Administrator\dev\bullet-trade_baihua`从`21a8456`快进至该提交，工作区干净。
+- 部署前QMT ready，但账本BLOCKED，存在3组同日委托ID重复，关联冲突为`broker fill id was reused with different fields`；本地活动订单为0。
+- 确认58620的进程命令指向fork的`.data/.env`后停止任务及服务进程，创建停服备份：`.data/backups/strategy-ledger-before-a465f68-20260907-234055.db`及同目录`env-before-a465f68-20260907-234055.env`。
+- 离线迁移至v11，`integrity_check=ok`、外键错误0；迁移后fills、strategy_orders、strategy_accounts与停服备份逐字段一致，服务器当时的发单时段检查为false。
+- 重启`BulletTradeBaihua-Server`后，58620由新PID3500监听；QMT仍为原XtMiniQmt PID4228，没有重启。
+- 23:42调用`strategy.get_snapshot`只读查询接口及`admin.health`验收：对账READY、blockers为空、strategy_ledger_ready=true、QMT ready、broker connected。没有调用提交目标、下单或撤单接口。
+- 重启查询后16笔成交和19条订单仍与备份逐字段一致，活动订单0：未新增盘后订单，未重复记账，也未改写原有成交。23:43抽查本次重启后的日志，未见ERROR或成交ID冲突。
+- `.env`与备份哈希一致：交易保持true，白名单仍只有`good_etf_remote`，缺价策略仍为ZERO_FALLBACK；没有更改账号、凭据、能力文件或交易授权。
+- 旧上游目录`C:\Users\Administrator\dev\bullet-trade`仍为`cd42a97`，原有`logs/app.log`修改及`command.txt`未跟踪状态保持不变，未进行写操作。
+
+本次部署不需要用户更新聚宽文件。当前验证证明盘后恢复和现有账本关联已正常；没有进行交易时段主动发单测试，后续开盘成交仍需按正常运行日志观察。
