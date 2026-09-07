@@ -376,6 +376,101 @@ async def test_ensure_account_ignores_unrelated_shared_account_activity(api):
 
 
 @pytest.mark.asyncio
+async def test_submit_rechecks_current_account_instead_of_cached_startup_flag(api):
+    service, broker, account, _ = api
+    await service.ensure_account(
+        account, "default", {"strategy_id": "good_etf", "initial_capital": 10_000}
+    )
+    service.startup_ready = False
+    result = await service.submit_targets(account, "default", {
+        "strategy_id": "good_etf", "idempotency_key": "after-reconnect",
+        "weights": {SECURITY: "0.5"}, "marks": {SECURITY: "10"},
+    })
+    assert result["reconciliation"]["state"] == "READY"
+    assert service.startup_ready is True
+    assert broker.order_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_submit_reports_fresh_blocker_before_valuation_or_order_side_effects(api, monkeypatch):
+    service, broker, account, notifications = api
+    await service.ensure_account(
+        account, "default", {"strategy_id": "good_etf", "initial_capital": 10_000}
+    )
+    service.startup_ready = False
+    broker.cash = 0
+    reads = []
+    original_query = broker.get_account_info
+
+    async def query(current_account):
+        reads.append(True)
+        return await original_query(current_account)
+
+    monkeypatch.setattr(broker, "get_account_info", query)
+    monkeypatch.setattr(service.valuation, "create_snapshot", lambda *a, **kw: pytest.fail(
+        "blocked submit must report reconciliation before valuation"
+    ))
+    with pytest.raises(RuntimeError, match="StrategyLedger对账未就绪") as caught:
+        await service.submit_targets(account, "default", {
+            "strategy_id": "good_etf", "idempotency_key": "still-blocked",
+            "weights": {SECURITY: "0.5"}, "marks": {SECURITY: "10"},
+        })
+    assert "strategy_id=good_etf" in str(caught.value)
+    assert "broker_cash_insufficient" in str(caught.value)
+    assert reads and broker.order_calls == 0 and broker.cancel_calls == []
+    assert notifications[-1].event == "RECONCILIATION_BLOCKED"
+    assert service.get_intent({"strategy_id": "good_etf"}) == {}
+
+
+@pytest.mark.asyncio
+async def test_missing_fill_price_blocks_then_recovers_from_valid_evidence_without_duplicate_order(api):
+    service, broker, account, _ = api
+    await service.ensure_account(
+        account, "default", {"strategy_id": "good_etf", "initial_capital": 10_000}
+    )
+    request = {
+        "strategy_id": "good_etf", "idempotency_key": "recover-unpriced-fill",
+        "weights": {SECURITY: "0.5"}, "marks": {SECURITY: "10"},
+    }
+    submitted = await service.submit_targets(account, "default", request)
+    db = connect_database(service.database_path)
+    try:
+        order = db.execute("SELECT requested_qty, limit_price_units FROM strategy_orders").fetchone()
+    finally:
+        db.close()
+    quantity, actual_price = order[0], order[1] / 1_000_000
+    broker.orders[0].update({"status": "filled", "amount": quantity, "filled": quantity})
+    broker.positions = [{"security": SECURITY, "amount": quantity, "closeable_amount": 0}]
+    broker.trades = [{
+        "trade_id": "late-price", "trade_id_source": "broker", "order_id": "broker-1",
+        "security": SECURITY, "side": "BUY", "amount": quantity, "price": 0,
+        "deal_balance": 0, "time": datetime.now(SHANGHAI_TZ).isoformat(),
+        "commission_fee": 5, "commission_known": True, "tax": 0, "tax_known": True,
+    }]
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="broker trade price is invalid") as caught:
+            await service.submit_targets(account, "default", request)
+        assert SECURITY in str(caught.value)
+        assert "成交待核实" in str(caught.value)
+    with pytest.raises(RuntimeError, match="broker trade price is invalid"):
+        await service._resume_intent_locked(submitted["intent"]["intent_id"])
+    assert broker.order_calls == 1 and broker.cancel_calls == []
+
+    # A later real query supplies the price; never substitute a quote or 0.
+    broker.trades[0]["price"] = actual_price
+    recovered = await service.submit_targets(account, "default", request)
+    await service.submit_targets(account, "default", request)
+    assert recovered["reconciliation"]["state"] == "READY"
+    assert recovered["intent"]["intent_id"] == submitted["intent"]["intent_id"]
+    assert broker.order_calls == 1
+    db = connect_database(service.database_path)
+    try:
+        assert db.execute("SELECT COUNT(*) FROM fills").fetchone()[0] == 1
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
 async def test_submit_targets_is_idempotent_and_exposes_queries(api):
     service, broker, account, notifications = api
     await service.ensure_account(

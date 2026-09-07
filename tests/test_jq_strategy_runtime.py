@@ -141,6 +141,18 @@ def test_public_hong_kong_etf_filter_supports_defaults_and_overrides(helper):
     assert helper.is_hong_kong_etf("520999.XSHG", "港红利ETF") is True
     assert helper.is_hong_kong_etf("510002.XSHG", "港口航运ETF") is False
     assert helper.is_hong_kong_etf("510003.XSHG", "红利ETF") is False
+    assert helper.is_hong_kong_etf("513320.XSHG", "HK新经济") is True
+    assert helper.is_hong_kong_etf("513320.XSHG", "") is True
+    assert helper.is_hong_kong_etf("159322.XSHE", "黄金股ETF平安") is True
+    assert helper.is_hong_kong_etf("513999.XSHG", "hk新经济") is True
+    assert helper.is_hong_kong_etf(
+        "159999.XSHE", "黄金股票ETF", "中证沪深港黄金产业股票指数"
+    ) is True
+    assert helper.is_hong_kong_etf("513100.XSHG", "纳指ETF") is False
+    assert helper.is_hong_kong_etf("518880.XSHG", "黄金ETF") is False
+    assert helper.is_hong_kong_etf(
+        "159322.XSHE", "黄金股ETF平安", code_denylist=(), keywords=()
+    ) is False
     assert helper.is_hong_kong_etf(
         "510001.XSHG", "科技ETF", "恒生科技指数"
     ) is True

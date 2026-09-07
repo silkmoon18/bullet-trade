@@ -227,6 +227,65 @@ def test_t0_fund_fill_is_booked_as_immediately_sellable(tmp_path):
     assert tuple(position) == (1000, 1000)
 
 
+def test_unpriced_completed_sell_stays_unbooked_until_valid_price_arrives(tmp_path):
+    database, repository, capital, reconciliation = _services(
+        tmp_path, UnpricedFillPolicy.CONSERVATIVE_ORDER_PRICE
+    )
+    booking = SQLiteFillBookingService(database)
+    booking.register_order(_order())
+    capital.reserve_cash(ACCOUNT_ID, money_to_units("2100"), 0, "buy-1")
+    reconciliation.synchronize(ACCOUNT_ID, PHYSICAL_ID, _snapshot(
+        "17995", positions=(BrokerPositionSnapshot(SECURITY, 1000, 0),),
+        orders=(_broker_order(),), trades=(_broker_trade(),),
+    ))
+    sell = replace(
+        _order("sell-zero", "broker-sell-zero"), side=OrderSide.SELL,
+        trading_day=date(2026, 8, 12), limit_price_units=None,
+    )
+    booking.register_order(sell)
+    broker_order = dict(
+        _broker_order(), order_id=sell.broker_order_id, side="SELL", is_buy=False,
+        order_time="2026-08-12 09:30:00", amount=1000, filled=1000,
+        order_price=0, broker_price=0, price=0,
+    )
+    trade = dict(
+        _broker_trade(), trade_id="sell-zero-trade", order_id=sell.broker_order_id,
+        side="SELL", price=0, traded_price=0, deal_balance=0,
+        time="2026-08-12 09:30:01",
+    )
+    for _ in range(2):
+        blocked = reconciliation.synchronize(ACCOUNT_ID, PHYSICAL_ID, _snapshot(
+            "20090", orders=(broker_order,), trades=(trade,), day=date(2026, 8, 12),
+        ))
+        assert blocked.state is ReconciliationState.BLOCKED
+        assert any(
+            "成交待核实" in blocker and SECURITY in blocker
+            for blocker in blocked.details["blockers"]
+        )
+        assert repository.get_strategy_account(ACCOUNT_ID).cash_units == money_to_units("7995")
+    db = connect_database(database)
+    try:
+        assert db.execute("SELECT COUNT(*) FROM fills").fetchone()[0] == 1
+        assert db.execute("SELECT total_qty FROM positions").fetchone()[0] == 1000
+    finally:
+        db.close()
+
+    # Only a genuine later fill price permits the existing trade to be booked.
+    trade["price"] = 2.1
+    for _ in range(2):
+        ready = reconciliation.synchronize(ACCOUNT_ID, PHYSICAL_ID, _snapshot(
+            "20090", orders=(broker_order,), trades=(trade,), day=date(2026, 8, 12),
+        ))
+        assert ready.state is ReconciliationState.READY
+        assert repository.get_strategy_account(ACCOUNT_ID).cash_units == money_to_units("10090")
+    db = connect_database(database)
+    try:
+        assert db.execute("SELECT COUNT(*) FROM fills").fetchone()[0] == 2
+        assert db.execute("SELECT total_qty FROM positions").fetchone()[0] == 0
+    finally:
+        db.close()
+
+
 def test_qmt_order_and_trade_ids_can_be_reused_on_a_later_trading_day(tmp_path):
     database, _, capital, reconciliation = _services(tmp_path)
     booking = SQLiteFillBookingService(database)

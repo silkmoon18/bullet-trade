@@ -347,12 +347,19 @@ def test_good_etf_uses_public_hong_kong_etf_filter(monkeypatch):
     ) is False
 
 
-def test_hk_short_name_fix_preserves_remaining_filters_ranking_and_weights(monkeypatch):
+@pytest.mark.parametrize("excluded_code, excluded_name", [
+    ("520890.XSHG", "港红利"),
+    ("513320.XSHG", "HK新经济"),
+    ("159322.XSHE", "黄金股ETF平安"),
+])
+def test_hk_short_name_fix_preserves_remaining_filters_ranking_and_weights(
+    monkeypatch, excluded_code, excluded_name
+):
     strategy = _load_strategy(monkeypatch)
     runtime = _Runtime(real_helper.RuntimeMode.JQ)
     strategy._runtime = runtime
-    codes = ["520890.XSHG", "510001.XSHG", "510002.XSHG", "510003.XSHG", "510004.XSHG"]
-    names = ["港红利", "港口航运ETF", "红利ETF", "科技ETF", "低流动性ETF"]
+    codes = [excluded_code, "510001.XSHG", "510002.XSHG", "510003.XSHG", "510004.XSHG"]
+    names = [excluded_name, "港口航运ETF", "红利ETF", "科技ETF", "低流动性ETF"]
     context = types.SimpleNamespace(
         previous_date=pd.Timestamp("2026-09-03").date(),
         current_dt=pd.Timestamp("2026-09-04 09:30:00"),

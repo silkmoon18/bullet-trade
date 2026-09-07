@@ -441,7 +441,11 @@ def normalize_trade_evidence(
             price_source = FillPriceSource.ORDER_PRICE_FALLBACK
             price_known = False
     if price_units is None:
-        raise BrokerContractError("broker trade price is invalid")
+        raise BrokerContractError(
+            "broker trade price is invalid; security={}; "
+            "成交价格/金额缺失或无效，且没有可用的委托价估算；"
+            "成交待核实，不能按0元入账".format(security)
+        )
 
     side = _side_from_row(trade)
     if side is None:

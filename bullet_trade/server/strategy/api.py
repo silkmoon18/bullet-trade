@@ -272,8 +272,6 @@ class SQLiteStrategyAPI:
     ) -> Dict[str, object]:
         strategy_id = self._strategy_id(payload)
         self._bind_runtime(strategy_id, account_context, account_key)
-        if not self.startup_ready:
-            raise RuntimeError("StrategyLedger startup reconciliation is not READY")
         key = str(payload.get("idempotency_key") or "").strip()
         weights = payload.get("weights")
         if not key or not isinstance(weights, Mapping):
@@ -297,7 +295,7 @@ class SQLiteStrategyAPI:
         else:
             raise ValueError("execution must be an object")
         snapshot, reconciliation, marks = await self._refresh(
-            account_context, account_key, strategy_id, payload
+            account_context, account_key, strategy_id, payload, require_ready=True
         )
         if any(_uses_quote_execution(execution_request, security) for security in marks):
             replace = getattr(
@@ -318,7 +316,7 @@ class SQLiteStrategyAPI:
             cancel_requested_order_ids.append(broker_order_id)
         if cancel_requested_order_ids:
             snapshot, reconciliation, marks = await self._refresh(
-                account_context, account_key, strategy_id, payload
+                account_context, account_key, strategy_id, payload, require_ready=True
             )
         quotes = await self._execution_quotes(
             execution_request, tuple(marks), snapshot.as_of
@@ -671,7 +669,9 @@ class SQLiteStrategyAPI:
             "total_amount": float(total),
         }
 
-    async def _refresh(self, account_context, account_key, strategy_id, payload):
+    async def _refresh(
+        self, account_context, account_key, strategy_id, payload, *, require_ready=False
+    ):
         physical_id = self._physical_id(account_key)
         broker_snapshot = await collect_async_broker_snapshot(
             cast(Any, self.broker), account_context
@@ -679,6 +679,17 @@ class SQLiteStrategyAPI:
         reconciliation = await self._synchronize(
             strategy_id, physical_id, broker_snapshot
         )
+        # Writes must use this account's fresh reconciliation, not the cached
+        # process-wide startup flag. Keep read-only snapshots available when
+        # blocked, but stop before valuation/planning/cancellation/dispatch.
+        if require_ready and reconciliation.state.value != "READY":
+            raise RuntimeError(
+                "StrategyLedger对账未就绪 | strategy_id={} | state={} | blockers={}".format(
+                    strategy_id,
+                    reconciliation.state.value,
+                    reconciliation.details.get("blockers", ()),
+                )
+            )
         as_of = self._as_of(payload.get("as_of"), broker_snapshot.as_of)
         raw_weights = payload.get("weights")
         target_securities = (
@@ -1092,6 +1103,7 @@ class SQLiteStrategyAPI:
                 "weights": {security: 0 for security in intent.targets},
                 "as_of": now,
             },
+            require_ready=True,
         )
         self._record_reconciliation_rejections(
             intent_id, reconciliation, execution_quotes
