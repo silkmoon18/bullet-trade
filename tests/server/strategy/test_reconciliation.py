@@ -24,6 +24,10 @@ from bullet_trade.server.strategy import (
     price_to_units,
 )
 from bullet_trade.server.strategy.domain import AccountStatus, SHANGHAI_TZ
+from bullet_trade.server.strategy.broker_history import (
+    SQLiteBrokerHistoryStore,
+    merge_broker_rows,
+)
 from bullet_trade.server.strategy.schema import connect_database
 
 
@@ -432,6 +436,89 @@ def test_zero_order_id_trade_is_relinked_by_strategy_client_tag(tmp_path):
 
     assert result.state is ReconciliationState.READY
     assert result.details["booked_trade_ids"] == ("trade-1",)
+
+
+@pytest.mark.parametrize("changed_field,changed_value", [
+    ("amount", 999), ("side", "SELL"), ("price", 2.1),
+])
+def test_reused_id_and_wrong_new_remark_do_not_rebind_an_existing_fill(
+    tmp_path, changed_field, changed_value,
+):
+    database, repository, capital, reconciliation = _services(tmp_path)
+    booking = SQLiteFillBookingService(database)
+    booking.register_order(_order())
+    capital.reserve_cash(ACCOUNT_ID, money_to_units("2100"), 0, "buy-1")
+    snapshot = _snapshot("17995", positions=(BrokerPositionSnapshot(SECURITY, 1000, 0),),
+                         orders=(_broker_order(),), trades=(_broker_trade(),))
+    assert reconciliation.synchronize(ACCOUNT_ID, PHYSICAL_ID, snapshot).state is ReconciliationState.READY
+    original_account = repository.get_strategy_account(ACCOUNT_ID)
+    newer = replace(_order("rejected-new", "broker-buy-1"),
+                    security="159322.XSHE", state=OrderState.REJECTED)
+    booking.register_order(newer)
+    snapshot.orders[0]["order_remark"] = newer.client_tag
+    snapshot.trades[0]["order_remark"] = newer.client_tag
+    for _ in range(2):
+        result = reconciliation.synchronize(ACCOUNT_ID, PHYSICAL_ID, snapshot)
+        assert result.state is ReconciliationState.READY
+        assert result.details["booked_trade_ids"] == ()
+        assert repository.get_strategy_account(ACCOUNT_ID) == original_account
+    db = connect_database(database)
+    try:
+        assert db.execute("SELECT COUNT(*) FROM fills").fetchone()[0] == 1
+        assert tuple(db.execute("SELECT state, filled_qty FROM strategy_orders WHERE order_id=?", (newer.order_id,)).fetchone()) == ("REJECTED", 0)
+    finally:
+        db.close()
+    # A saved link does not excuse changed evidence, even without broker orders.
+    snapshot.trades[0][changed_field] = changed_value
+    replay = replace(snapshot, orders=())
+    result = reconciliation.synchronize(ACCOUNT_ID, PHYSICAL_ID, replay)
+    assert result.state is ReconciliationState.BLOCKED
+    assert any("trade_error:" in item for item in result.details["blockers"])
+    assert repository.get_strategy_account(ACCOUNT_ID).cash_units == original_account.cash_units
+
+
+@pytest.mark.parametrize("link", ["tag", "sysid", "ambiguous"])
+def test_same_day_same_symbol_same_id_orders_require_unique_fill_link(tmp_path, link):
+    database, repository, capital, reconciliation = _services(tmp_path)
+    booking = SQLiteFillBookingService(database)
+    orders, trades = [], []
+    for index in range(2):
+        local = _order("buy-{}".format(index), "REUSED")
+        booking.register_order(local)
+        capital.reserve_cash(ACCOUNT_ID, money_to_units("2100"), index, local.order_id)
+        order = dict(_broker_order(), order_id="REUSED", amount=1000,
+                     order_remark=local.client_tag, order_sysid="SYS-{}".format(index))
+        trade = dict(_broker_trade(), order_id="REUSED", trade_id="T-{}".format(index))
+        if link == "tag":
+            trade["order_remark"] = local.client_tag
+        elif link == "sysid":
+            trade["order_sysid"] = order["order_sysid"]
+        orders.append(order)
+        trades.append(trade)
+    snapshot = _snapshot("15990", positions=(BrokerPositionSnapshot(SECURITY, 2000, 0),),
+                         orders=orders, trades=trades)
+    store = SQLiteBrokerHistoryStore(database)
+    for row in orders:
+        store.record_order("default", row, snapshot.as_of)
+    for row in trades:
+        store.record_trade("default", row, snapshot.as_of)
+    # Run through the adapter's history merge after reopening the same database.
+    history = SQLiteBrokerHistoryStore(database).snapshot("default")
+    snapshot = replace(
+        snapshot,
+        orders=tuple(merge_broker_rows(orders, history.orders, "order_id")),
+        trades=tuple(merge_broker_rows(trades, history.trades, "trade_id")),
+    )
+    assert len(snapshot.orders) == len(snapshot.trades) == 2
+    for _ in range(2):
+        result = reconciliation.synchronize(ACCOUNT_ID, PHYSICAL_ID, snapshot)
+        if link == "ambiguous":
+            assert result.state is ReconciliationState.BLOCKED
+            assert any("ambiguous_owned_trade_identity" in x for x in result.details["blockers"])
+            assert repository.get_strategy_account(ACCOUNT_ID).cash_units == money_to_units("10000")
+        else:
+            assert result.state is ReconciliationState.READY
+            assert repository.get_strategy_account(ACCOUNT_ID).cash_units == money_to_units("5990")
 
 
 def test_zero_order_id_trade_is_relinked_by_counter_contract_id(tmp_path):

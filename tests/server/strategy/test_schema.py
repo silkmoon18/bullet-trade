@@ -194,6 +194,22 @@ def test_database_constraints_reject_invalid_balances_state_and_float(tmp_path):
         connection.close()
 
 
+def test_order_observation_migration_preserves_v10_history(tmp_path):
+    db = connect_database(tmp_path / "v10.db")
+    try:
+        apply_migrations(db, target_version=10)
+        db.execute("INSERT INTO broker_order_history VALUES (?, ?, ?, ?, ?, ?)",
+                   ("default", "2026-09-07", "REUSED", '{"order_id":"REUSED"}', "first", "last"))
+        before = tuple(db.execute("SELECT * FROM broker_order_history").fetchone())
+        apply_migrations(db)
+        assert tuple(db.execute("SELECT * FROM broker_order_history").fetchone()) == before + (0,)
+        db.execute("INSERT INTO broker_order_history VALUES (?, ?, ?, ?, ?, ?, ?)", before + (1,))
+        assert db.execute("SELECT COUNT(*) FROM broker_order_history").fetchone()[0] == 2
+        assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    finally:
+        db.close()
+
+
 def test_failed_migration_rolls_back_its_schema_changes():
     connection = connect_database(":memory:")
     broken = (

@@ -592,6 +592,35 @@ MIGRATIONS: Tuple[Migration, ...] = (
             ),
         ),
     ),
+    Migration(
+        11,
+        "same_day_broker_order_observations",
+        (
+            "DROP INDEX idx_broker_order_history_last_seen",
+            "ALTER TABLE broker_order_history RENAME TO broker_order_history_v9",
+            """
+            CREATE TABLE broker_order_history (
+                account_key TEXT NOT NULL,
+                trading_day TEXT NOT NULL,
+                broker_order_id TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                observation_no INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (account_key, trading_day, broker_order_id, observation_no)
+            )
+            """,
+            """
+            INSERT INTO broker_order_history (
+                account_key, trading_day, broker_order_id, payload_json, first_seen_at, last_seen_at
+            )
+            SELECT account_key, trading_day, broker_order_id, payload_json, first_seen_at, last_seen_at
+            FROM broker_order_history_v9
+            """,
+            "DROP TABLE broker_order_history_v9",
+            "CREATE INDEX idx_broker_order_history_last_seen ON broker_order_history(account_key,last_seen_at)",
+        ),
+    ),
 )
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1].version

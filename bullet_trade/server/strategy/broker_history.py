@@ -163,6 +163,38 @@ def _merge_payload(
     return merged
 
 
+def _order_identity(row: Mapping[str, object]) -> dict:
+    """Only identity fields, not changing fill quantities, state or prices."""
+    side = str(row.get("side") or row.get("order_side") or "").upper()
+    if not side and type(row.get("is_buy")) is bool:
+        side = "BUY" if row["is_buy"] else "SELL"
+    timestamp = _event_datetime(row.get("order_time") or row.get("time"))
+    values = {
+        "security": row.get("security"),
+        "side": side,
+        "quantity": row.get("amount") or row.get("quantity"),
+        "remark": row.get("order_remark") or row.get("remark"),
+        "sysid": row.get("order_sysid") or row.get("sysid"),
+        "time": as_shanghai_time(timestamp).isoformat() if timestamp else None,
+    }
+    return {
+        key: str(value).strip()
+        for key, value in values.items() if value not in (None, "", 0, "0")
+    }
+
+
+def _matching_order_observation(rows, current):
+    """Return one compatible observation, never pick between conflicting orders."""
+    identity = _order_identity(current)
+    candidates = [index for index, row in enumerate(rows) if all(
+        identity[key] == value for key, value in _order_identity(row).items() if key in identity
+    )]
+    if len(candidates) == 1:
+        return candidates[0]
+    exact = [index for index in candidates if _order_identity(rows[index]) == identity]
+    return exact[0] if len(exact) == 1 else None
+
+
 class SQLiteBrokerHistoryStore:
     """Persist every normalized QMT observation that reached this server."""
 
@@ -275,13 +307,23 @@ class SQLiteBrokerHistoryStore:
         connection = connect_database(self.database_path)
         try:
             connection.execute("BEGIN IMMEDIATE")
-            existing = connection.execute(
-                "SELECT payload_json FROM {} WHERE account_key = ? "
+            existing_rows = connection.execute(
+                "SELECT * FROM {} WHERE account_key = ? "
                 "AND trading_day = ? AND {} = ?".format(
                     table, id_column
                 ),
                 (account, trading_day, broker_id),
-            ).fetchone()
+            ).fetchall()
+            existing = existing_rows[0] if existing_rows else None
+            observation_no = 0
+            if kind == "order":
+                index = _matching_order_observation(
+                    [json.loads(row["payload_json"]) for row in existing_rows], payload
+                )
+                existing = existing_rows[index] if index is not None else None
+                observation_no = existing["observation_no"] if existing is not None else max(
+                    (row["observation_no"] for row in existing_rows), default=-1
+                ) + 1
             merged = dict(payload)
             if existing is not None:
                 previous = json.loads(cast(str, existing["payload_json"]))
@@ -290,12 +332,16 @@ class SQLiteBrokerHistoryStore:
                 """
                 INSERT INTO {table}(
                     account_key, trading_day, {id_column}, payload_json,
-                    first_seen_at, last_seen_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(account_key, trading_day, {id_column}) DO UPDATE SET
+                    first_seen_at, last_seen_at{extra_column}
+                ) VALUES (?, ?, ?, ?, ?, ?{extra_placeholder})
+                ON CONFLICT(account_key, trading_day, {id_column}{extra_column}) DO UPDATE SET
                     payload_json = excluded.payload_json,
                     last_seen_at = excluded.last_seen_at
-                """.format(table=table, id_column=id_column),
+                """.format(
+                    table=table, id_column=id_column,
+                    extra_column=", observation_no" if kind == "order" else "",
+                    extra_placeholder=", ?" if kind == "order" else "",
+                ),
                 (
                     account,
                     trading_day,
@@ -303,7 +349,7 @@ class SQLiteBrokerHistoryStore:
                     _payload_json(merged),
                     timestamp,
                     timestamp,
-                ),
+                ) + ((observation_no,) if kind == "order" else ()),
             )
             connection.commit()
             return True
@@ -361,17 +407,21 @@ def merge_broker_rows(
         historical = dict(row)
         historical["_broker_history_only"] = True
         day = broker_trading_day(historical, kind)
-        merged[(day, broker_id)] = historical
+        merged[(day, broker_id, len(merged) if kind == "order" else 0)] = historical
     for row in current:
         broker_id = str(row.get(id_key) or "").strip()
         if not broker_id:
             continue
         day = broker_trading_day(row, kind)
-        if day is None:
-            candidates = [key for key in merged if key[1] == broker_id]
-            key = candidates[0] if len(candidates) == 1 else (None, broker_id)
+        candidates = [
+            key for key in merged
+            if key[1] == broker_id and (day is None or key[0] == day)
+        ]
+        if kind == "order":
+            index = _matching_order_observation([merged[key] for key in candidates], row)
+            key = candidates[index] if index is not None else (day, broker_id, len(merged))
         else:
-            key = (day, broker_id)
+            key = candidates[0] if len(candidates) == 1 else (day, broker_id, 0)
         merged[key] = dict(_merge_payload(merged.get(key, {}), row))
         if day is not None:
             merged[key]["_broker_trading_day"] = day

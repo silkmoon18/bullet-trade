@@ -1083,10 +1083,24 @@ class QmtBroker(BrokerBase):
         wait_result = self._last_order_wait_results.get(str(order_id))
         if not isinstance(wait_result, dict):
             return
+        snapshot = wait_result.get("last_snapshot")
+        if isinstance(snapshot, dict):
+            # A same-day id can be reused. Do not attach the newer request's
+            # remark/status to a different native order or its old fills.
+            for key in ("security", "order_remark"):
+                current, saved = row.get(key), snapshot.get(key)
+                if current and saved:
+                    if key == "security":
+                        current, saved = self._map_security(str(current)), self._map_security(str(saved))
+                    if current != saved:
+                        return
+            current_side = self._map_order_side(row.get("order_type"))
+            saved_side = self._map_order_side(snapshot.get("order_type"))
+            if current_side is not None and saved_side is not None and current_side != saved_side:
+                return
         for key in ("timed_out", "async_tracking", "wait_timeout", "elapsed"):
             if key in wait_result:
                 row[key] = wait_result.get(key)
-        snapshot = wait_result.get("last_snapshot")
         if isinstance(snapshot, dict):
             row["last_snapshot"] = dict(snapshot)
             for key in ("order_remark", "strategy_name"):

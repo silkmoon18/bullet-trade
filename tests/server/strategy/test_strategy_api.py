@@ -31,6 +31,55 @@ from bullet_trade.server.strategy.domain import IntentState, SHANGHAI_TZ
 SECURITY = "510050.XSHG"
 
 
+@pytest.fixture(autouse=True)
+def execution_clock(monkeypatch):
+    # Existing execution cases test trading-time behaviour, independently of
+    # the developer's wall clock. Session-specific cases override this below.
+    monkeypatch.setattr(SQLiteStrategyAPI, "_can_dispatch_now", lambda self: True)
+
+
+@pytest.mark.parametrize("day,hour,minute,allowed", [
+    (7, 9, 29, False), (7, 9, 30, True), (7, 11, 30, False),
+    (7, 13, 0, True), (7, 14, 59, True), (7, 15, 0, False),
+    (7, 21, 26, False), (12, 10, 0, False), (13, 10, 0, False),
+])
+def test_execution_session_boundaries(day, hour, minute, allowed):
+    assert SQLiteStrategyAPI._is_execution_session(
+        datetime(2026, 9, day, hour, minute, tzinfo=SHANGHAI_TZ)
+    ) is allowed
+
+
+@pytest.mark.asyncio
+async def test_after_hours_target_is_not_created_or_dispatched(api, monkeypatch):
+    service, broker, account, _ = api
+    monkeypatch.setattr(service, "_can_dispatch_now", lambda: False)
+    with pytest.raises(RuntimeError, match="非发单时段"):
+        await service.submit_targets(account, "default", {
+            "strategy_id": "good_etf", "idempotency_key": "closed",
+            "weights": {SECURITY: 0.5},
+            "as_of": "2026-09-07T09:30:00+08:00",  # Cannot spoof wall time.
+        })
+    assert broker.order_calls == 0
+    assert service.planner.active_intents() == ()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_checks_time_before_each_order(api, monkeypatch):
+    service, _, _, _ = api
+    session_open = [True]
+    monkeypatch.setattr(service, "_can_dispatch_now", lambda: session_open[0])
+    calls = []
+
+    async def dispatch(submitter, strategy_id):
+        calls.append(strategy_id)
+        session_open[0] = False
+        return "first-dispatch"
+
+    monkeypatch.setattr(service.planner, "dispatch_next", dispatch)
+    assert await service._dispatch_pending(None, "good_etf") == ("first-dispatch",)
+    assert calls == ["good_etf"]
+
+
 def _capabilities():
     supported = CapabilityState.SUPPORTED
     return BrokerCapabilityProfile(
@@ -205,7 +254,8 @@ async def test_startup_rebinds_all_but_reconciles_only_enabled_strategy(
 
 
 @pytest.mark.asyncio
-async def test_resume_dispatches_existing_pending_outbox_without_new_order(api):
+@pytest.mark.parametrize("market_open", [True, False])
+async def test_resume_dispatches_existing_pending_outbox_without_new_order(api, monkeypatch, market_open):
     service, broker, account, _ = api
     await service.ensure_account(
         account,
@@ -234,17 +284,54 @@ async def test_resume_dispatches_existing_pending_outbox_without_new_order(api):
     )
     assert len(planned.orders) == 1
     assert broker.order_calls == 0
+    monkeypatch.setattr(service, "_can_dispatch_now", lambda: market_open)
 
     await asyncio.wait_for(
         service._resume_intent_locked(planned.intent.intent_id), timeout=2
     )
 
-    assert broker.order_calls == 1
+    assert broker.order_calls == int(market_open)
     connection = connect_database(service.database_path)
     try:
-        assert connection.execute("SELECT state FROM outbox").fetchone()[0] == "DONE"
+        assert connection.execute("SELECT state FROM outbox").fetchone()[0] == (
+            "DONE" if market_open else "PENDING"
+        )
     finally:
         connection.close()
+
+
+@pytest.mark.asyncio
+async def test_after_hours_callback_books_fill_without_planning_or_dispatch(api, monkeypatch):
+    service, broker, account, _ = api
+    await service.ensure_account(account, "default", {
+        "strategy_id": "good_etf", "initial_capital": 10_000,
+    })
+    await service.submit_targets(account, "default", {
+        "strategy_id": "good_etf", "idempotency_key": "daytime",
+        "weights": {SECURITY: "0.5"}, "marks": {SECURITY: "10"},
+    })
+    db = connect_database(service.database_path)
+    try:
+        qty, price = db.execute("SELECT requested_qty, limit_price_units FROM strategy_orders").fetchone()
+    finally:
+        db.close()
+    broker.positions = [{"security": SECURITY, "amount": qty, "closeable_amount": 0}]
+    broker.orders[0]["status"] = "filled"
+    broker.trades = [{
+        "trade_id": "late-fill", "trade_id_source": "broker", "order_id": "broker-1",
+        "security": SECURITY, "side": "BUY", "amount": qty, "price": price / 1_000_000,
+        "time": datetime.now(SHANGHAI_TZ).isoformat(),
+    }]
+    monkeypatch.setattr(service, "_can_dispatch_now", lambda: False)
+    monkeypatch.setattr(service.planner, "advance_intent", lambda *a, **kw: pytest.fail("closed planning"))
+    await service._handle_broker_event("default", "trade")
+    assert broker.order_calls == 1 and broker.cancel_calls == []
+    db = connect_database(service.database_path)
+    try:
+        assert db.execute("SELECT COUNT(*) FROM fills").fetchone()[0] == 1
+        assert db.execute("SELECT total_qty FROM positions").fetchone()[0] == qty
+    finally:
+        db.close()
 
 
 @pytest.mark.asyncio

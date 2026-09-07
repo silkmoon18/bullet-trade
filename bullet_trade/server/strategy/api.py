@@ -294,6 +294,8 @@ class SQLiteStrategyAPI:
             execution_request = execution_request_from_wire(raw_execution)
         else:
             raise ValueError("execution must be an object")
+        if not self._can_dispatch_now():
+            raise RuntimeError("当前非发单时段，目标未提交；仅在工作日09:30-11:30、13:00-15:00发单")
         snapshot, reconciliation, marks = await self._refresh(
             account_context, account_key, strategy_id, payload, require_ready=True
         )
@@ -1069,6 +1071,16 @@ class SQLiteStrategyAPI:
         if binding is None:
             return
         now = datetime.now(SHANGHAI_TZ)
+        if not self._can_dispatch_now():
+            # Late/reconnect callbacks still book fills; they must not plan or
+            # dispatch the unfinished daytime target using an old closing tick.
+            broker_snapshot = await collect_async_broker_snapshot(
+                cast(Any, self.broker), binding[0]
+            )
+            await self._synchronize(
+                intent.account_id, self._physical_id(binding[1]), broker_snapshot
+            )
+            return
         execution_quotes = dict(self._quote_cache)
         if quote_overrides:
             execution_quotes.update(quote_overrides)
@@ -1153,7 +1165,7 @@ class SQLiteStrategyAPI:
     async def _dispatch_pending(self, submitter, strategy_account_id: str):
         dispatched = []
         async with self._dispatch_lock:
-            while True:
+            while self._can_dispatch_now():
                 dispatch = await self.planner.dispatch_next(
                     submitter, strategy_account_id
                 )
@@ -1356,10 +1368,15 @@ class SQLiteStrategyAPI:
 
     @staticmethod
     def _is_execution_session(value: datetime) -> bool:
+        value = value.astimezone(SHANGHAI_TZ)
         minutes = value.hour * 60 + value.minute
-        return 9 * 60 + 30 <= minutes < 11 * 60 + 30 or (
-            13 * 60 <= minutes < 15 * 60
+        return value.weekday() < 5 and (
+            9 * 60 + 30 <= minutes < 11 * 60 + 30
+            or 13 * 60 <= minutes < 15 * 60
         )
+
+    def _can_dispatch_now(self) -> bool:
+        return self._is_execution_session(datetime.now(SHANGHAI_TZ))
 
     def _valuation_mark_max_age(self, now: datetime) -> timedelta:
         current = self._as_of(now, None)

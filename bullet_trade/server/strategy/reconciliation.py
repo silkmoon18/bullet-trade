@@ -16,6 +16,7 @@ from .broker_contract import (
     BrokerContractError,
     normalize_trade_evidence,
     require_strategy_ledger_v1,
+    _side_from_row,
 )
 from .broker_history import broker_trading_day
 from .domain import (
@@ -338,13 +339,14 @@ class SQLiteReconciliationService:
         booked_trade_ids = []
         ignored_broker_order_count = 0
         ignored_broker_trade_count = 0
-        (
-            orders_by_broker_key,
-            orders_by_client_tag,
-            all_orders_by_client_tag,
-        ) = self._local_orders(account_id)
+        local_orders, all_orders_by_client_tag, booked_order_links = self._local_orders(
+            account_id
+        )
+        orders_by_id = {row["order_id"]: row for row in local_orders}
+        # Broker ids can also repeat within a trading day.
+        # Index matched observations by our immutable local order id instead.
         broker_orders = {}
-        broker_order_ids_by_sysid = {}
+        local_order_ids_by_sysid = {}
         adopted_order_ids = []
         rejected_orders = []
         for row in snapshot.orders:
@@ -358,46 +360,33 @@ class SQLiteReconciliationService:
                     ignored_broker_order_count += 1
                 continue
             trading_day = broker_trading_day(row, "order", snapshot.as_of)
-            broker_key = (trading_day, broker_order_id)
-            broker_orders[broker_key] = row
-            order_sysid = _broker_identifier(
-                row.get("order_sysid") or row.get("sysid")
-            )
-            if order_sysid:
-                broker_order_ids_by_sysid.setdefault(
-                    (trading_day, order_sysid), set()
-                ).add(
-                    broker_key
+            try:
+                local = self._match_local_order(
+                    row, local_orders, trading_day, broker_order_id, "order"
                 )
-            local = orders_by_broker_key.get(broker_key)
-            if local is None:
-                matches = {
-                    orders_by_client_tag[token]["order_id"]: orders_by_client_tag[token]
-                    for token in (item.strip() for item in remark.split("|"))
-                    if token in orders_by_client_tag
-                }
-                if len(matches) == 1:
-                    local = next(iter(matches.values()))
-                    try:
+                if local is not None:
+                    if not local["broker_order_id"]:
                         adopted = self._booking.mark_order_submitted(
                             account_id,
                             local["order_id"],
                             broker_order_id,
                         )
-                        local = dict(local)
                         local["broker_order_id"] = broker_order_id
                         local["state"] = adopted.state.value
-                        broker_key = (local["trading_day"], broker_order_id)
-                        orders_by_broker_key[broker_key] = local
                         adopted_order_ids.append(local["order_id"])
-                    except (RepositoryError, ValueError) as exc:
-                        blockers.append(
-                            "order_adoption_error:{}:{}".format(
-                                broker_order_id, str(exc)
-                            )
-                        )
-                elif len(matches) > 1:
-                    blockers.append("ambiguous_order_remark:{}".format(broker_order_id))
+                    broker_orders[local["order_id"]] = row
+                    order_sysid = _broker_identifier(
+                        row.get("order_sysid") or row.get("sysid")
+                    )
+                    if order_sysid:
+                        local_order_ids_by_sysid.setdefault(
+                            (trading_day, order_sysid), set()
+                        ).add(local["order_id"])
+            except (BrokerContractError, RepositoryError, ValueError) as exc:
+                blockers.append(
+                    "order_match_error:{}:{}".format(broker_order_id, str(exc))
+                )
+                continue
             if local is None:
                 if remark_matches:
                     blockers.append(
@@ -412,44 +401,41 @@ class SQLiteReconciliationService:
         ):
             broker_order_id = _broker_identifier(trade.get("order_id"))
             trading_day = broker_trading_day(trade, "trade", snapshot.as_of)
-            broker_key = (trading_day, broker_order_id)
-            local = orders_by_broker_key.get(broker_key)
-            if local is None:
+            remark = _text(trade.get("order_remark") or trade.get("remark"))
+            try:
+                # A stored fill already proves its original local order. Check
+                # its other immutable fields again in book_fill, never rebind it.
+                booked_id = booked_order_links.get(
+                    (trading_day, _text(trade.get("trade_id")))
+                )
+                local = orders_by_id.get(booked_id)
+                if (
+                    local is not None and broker_order_id
+                    and broker_order_id != local["broker_order_id"]
+                ):
+                    raise BrokerContractError("booked_trade_order_link_changed")
                 trade_sysid = _broker_identifier(
                     trade.get("order_sysid") or trade.get("sysid")
                 )
-                matching_order_keys = broker_order_ids_by_sysid.get(
+                matching_order_ids = local_order_ids_by_sysid.get(
                     (trading_day, trade_sysid), set()
                 )
-                if len(matching_order_keys) == 1:
-                    candidate_key = next(iter(matching_order_keys))
-                    candidate = orders_by_broker_key.get(candidate_key)
-                    if candidate is not None:
-                        broker_key = candidate_key
-                        broker_order_id = candidate_key[1]
-                        local = candidate
-            remark = _text(trade.get("order_remark") or trade.get("remark"))
-            if local is None and remark:
-                matches = {
-                    all_orders_by_client_tag[token]["order_id"]: all_orders_by_client_tag[
-                        token
-                    ]
-                    for token in (item.strip() for item in remark.split("|"))
-                    if token in all_orders_by_client_tag
-                    and (
-                        all_orders_by_client_tag[token].get("trading_day"),
-                        _broker_identifier(
-                            all_orders_by_client_tag[token].get("broker_order_id")
-                        ),
-                    ) in broker_orders
-                }
-                if len(matches) == 1:
-                    candidate = next(iter(matches.values()))
-                    broker_order_id = _broker_identifier(
-                        candidate.get("broker_order_id")
+                if local is None and len(matching_order_ids) == 1:
+                    candidate = orders_by_id[next(iter(matching_order_ids))]
+                    local = self._match_local_order(
+                        trade, [candidate], trading_day, candidate["broker_order_id"], "trade"
                     )
-                    broker_key = (candidate.get("trading_day"), broker_order_id)
-                    local = candidate
+                if local is None:
+                    local = self._match_local_order(
+                        trade, local_orders, trading_day, broker_order_id, "trade"
+                    )
+                if local is not None:
+                    broker_order_id = local["broker_order_id"]
+            except BrokerContractError as exc:
+                blockers.append(
+                    "trade_error:{}:{}".format(_text(trade.get("trade_id")), str(exc))
+                )
+                continue
             if local is None:
                 if self._remark_matches(remark, all_orders_by_client_tag):
                     blockers.append(
@@ -461,8 +447,8 @@ class SQLiteReconciliationService:
             try:
                 linked_trade = dict(trade)
                 linked_trade["order_id"] = broker_order_id
-                matching_broker_order = broker_orders.get(broker_key)
-                if matching_broker_order is None:
+                matching_broker_order = broker_orders.get(local["order_id"])
+                if matching_broker_order is None and _side_from_row(linked_trade) is None:
                     # Durable fills can outlive the broker's order query.  The
                     # day-scoped local order remains authoritative for side;
                     # booking still verifies every other immutable fill field.
@@ -519,11 +505,11 @@ class SQLiteReconciliationService:
                     )
                 )
 
-        for broker_key, row in broker_orders.items():
-            broker_order_id = broker_key[1]
-            local = orders_by_broker_key.get(broker_key)
+        for local_id, row in broker_orders.items():
+            local = orders_by_id[local_id]
+            broker_order_id = local["broker_order_id"]
             terminal = _order_state(row.get("status"))
-            if local is None or terminal is None:
+            if terminal is None:
                 continue
             if terminal is OrderState.REJECTED:
                 reason = _text(
@@ -551,18 +537,18 @@ class SQLiteReconciliationService:
             except RepositoryError as exc:
                 blockers.append("order_error:{}:{}".format(broker_order_id, str(exc)))
 
-        current_broker_keys = {
-            broker_key
-            for broker_key, row in broker_orders.items()
+        current_local_ids = {
+            local_id
+            for local_id, row in broker_orders.items()
             if row.get("_broker_history_only") is not True
         }
-        for broker_key, local in orders_by_broker_key.items():
+        for local in local_orders:
             if local["state"] in (
                 OrderState.SUBMITTED.value,
                 OrderState.PARTIALLY_FILLED.value,
                 OrderState.SUBMIT_UNKNOWN.value,
-            ) and broker_key not in current_broker_keys:
-                blockers.append("missing_working_order:{}".format(broker_key[1]))
+            ) and local["order_id"] not in current_local_ids:
+                blockers.append("missing_working_order:{}".format(local["broker_order_id"]))
 
         required_cash, owned_positions, frozen_sell_qty = self._ledger_view(
             account_id, physical_account_id, snapshot.as_of
@@ -694,28 +680,66 @@ class SQLiteReconciliationService:
                 (account_id,),
             ).fetchall()
             local_orders = [dict(row) for row in rows]
-            by_broker_key = {
-                (row["trading_day"], row["broker_order_id"]): row
-                for row in local_orders
-                if row["broker_order_id"]
-            }
-            by_client_tag = {
-                row["client_tag"]: row
-                for row in local_orders
-                if not row["broker_order_id"]
-                and row["state"] in (
-                    OrderState.PENDING_SUBMIT.value,
-                    OrderState.SUBMIT_UNKNOWN.value,
-                )
-            }
             all_by_client_tag = {
                 row["client_tag"]: row
                 for row in local_orders
                 if row["client_tag"]
             }
-            return by_broker_key, by_client_tag, all_by_client_tag
+            booked_links = {
+                (row["traded_at"][:10], row["broker_trade_id"]): row["order_id"]
+                for row in connection.execute(
+                    "SELECT f.traded_at, f.broker_trade_id, f.order_id FROM fills f "
+                    "JOIN strategy_orders o ON o.order_id = f.order_id "
+                    "WHERE o.strategy_account_id = ?", (account_id,)
+                )
+            }
+            return local_orders, all_by_client_tag, booked_links
         finally:
             connection.close()
+
+    @staticmethod
+    def _match_local_order(row, local_orders, trading_day, broker_order_id, kind):
+        security = _security(row.get("security") or row.get("stock_code") or "")
+        side = _side_from_row(row)
+        remark = _text(row.get("order_remark") or row.get("remark"))
+        tokens = {item.strip() for item in remark.split("|") if item.strip()}
+        candidates = []
+        for local in local_orders:
+            if local["trading_day"] != trading_day:
+                continue
+            if security and security != local["security"]:
+                continue
+            if side is not None and side.value != local["side"]:
+                continue
+            local_broker_id = local["broker_order_id"]
+            tagged = local["client_tag"] in tokens
+            if local_broker_id:
+                if broker_order_id and broker_order_id != local_broker_id:
+                    continue
+                if not broker_order_id and not tagged:
+                    continue
+            elif not (kind == "order" and tagged and local["state"] in (
+                OrderState.PENDING_SUBMIT.value, OrderState.SUBMIT_UNKNOWN.value,
+            )):
+                continue
+            quantity = row.get("amount") or row.get("quantity")
+            if kind == "order" and quantity not in (None, ""):
+                try:
+                    if int(quantity) != local["requested_qty"]:
+                        continue
+                except (TypeError, ValueError):
+                    continue
+            candidates.append(local)
+        tagged_candidates = [local for local in candidates if local["client_tag"] in tokens]
+        if tagged_candidates:
+            candidates = tagged_candidates
+        elif any(token.startswith("bt:") for token in tokens) and not any(
+            local["client_tag"] in tokens for local in local_orders
+        ):
+            return None  # An explicit tag from another strategy is not ours.
+        if len(candidates) > 1:
+            raise BrokerContractError("ambiguous_owned_{}_identity".format(kind))
+        return candidates[0] if candidates else None
 
     @staticmethod
     def _remark_matches(remark: str, orders_by_client_tag) -> bool:

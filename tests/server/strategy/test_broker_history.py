@@ -34,6 +34,53 @@ def test_broker_history_survives_reopen_and_updates_order_state(tmp_path):
     assert rows[0]["status"] == "filled"
 
 
+def test_same_day_reused_order_id_never_mix_fields_and_survive_restart(tmp_path):
+    database = tmp_path / "ledger.db"
+    store = SQLiteBrokerHistoryStore(database)
+    first = {"order_id": "REUSED", "security": "159031.XSHE", "side": "SELL",
+             "order_remark": "bt:old", "order_time": "2026-09-07 09:30:00",
+             "status": "filled", "price": 1.05, "filled": 1000, "amount": 1000}
+    second = {"order_id": "REUSED", "security": "159322.XSHE", "side": "BUY",
+              "order_remark": "bt:new", "order_time": "2026-09-07 21:26:00",
+              "status": "rejected", "price": 0, "filled": 0, "amount": 1000}
+    for row in (first, second, first, second):
+        store.record_order("default", row)
+    history = SQLiteBrokerHistoryStore(database).list_orders("default")
+    assert len(history) == 2
+    rows = {row["order_remark"]: row for row in history}
+    for original in (first, second):
+        assert all(rows[original["order_remark"]][k] == v for k, v in original.items())
+    merged = merge_broker_rows([first], history, "order_id")
+    assert len(merged) == 2
+    assert next(row for row in merged if row["order_remark"] == "bt:new")["price"] == 0
+    assert next(row for row in merged if row["order_remark"] == "bt:new")["_broker_history_only"] is True
+    # A partial callback without identifying fields cannot update either order.
+    partial = {"order_id": "REUSED", "status": "canceled", "_broker_trading_day": "2026-09-07"}
+    for _ in range(2):
+        store.record_order("default", partial)
+    assert len(store.list_orders("default")) == 3
+    for row in store.list_orders("default"):
+        if row.get("order_remark") == "bt:old":
+            assert row["status"] == "filled"
+        if row.get("order_remark") == "bt:new":
+            assert row["status"] == "rejected" and row["price"] == 0
+
+
+def test_same_symbol_same_side_reused_id_keeps_distinct_tags(tmp_path):
+    store = SQLiteBrokerHistoryStore(tmp_path / "ledger.db")
+    base = {"order_id": "REUSED", "security": "510050.XSHG", "side": "BUY",
+            "amount": 100, "_broker_trading_day": "2026-09-07"}
+    old = dict(base, order_remark="bt:old", status="filled", price=2.5)
+    new = dict(base, order_remark="bt:new", status="open", price=0)
+    for row in (old, new):
+        store.record_order("default", row)
+    merged = merge_broker_rows([dict(new, status="canceled")], store.list_orders("default"), "order_id")
+    assert len(merged) == 2
+    assert {r["order_remark"]: (r["status"], r["price"]) for r in merged} == {
+        "bt:old": ("filled", 2.5), "bt:new": ("canceled", 0),
+    }
+
+
 def test_trade_history_preserves_known_fee_when_later_callback_omits_it(tmp_path):
     store = SQLiteBrokerHistoryStore(tmp_path / "ledger.db")
     store.record_trade(

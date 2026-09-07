@@ -24,6 +24,21 @@ def test_qmt_broker_get_orders_filters(monkeypatch):
     assert "2" not in ids
 
 
+@pytest.mark.parametrize("snapshot", [
+    {"security": "159322.XSHE", "order_type": 23, "order_remark": "bt:new"},
+    {"security": "159031.XSHE", "order_type": 23, "order_remark": "bt:new"},
+])
+def test_reused_order_id_does_not_attach_another_orders_wait_metadata(snapshot):
+    broker = QmtBroker(account_id="demo")
+    broker._last_order_wait_results["REUSED"] = {
+        "timed_out": True, "last_snapshot": snapshot,
+    }
+    row = {"order_id": "REUSED", "security": "159031.XSHE", "order_type": 24, "status": "filled"}
+    original = dict(row)
+    broker._attach_order_wait_trace(row, "REUSED")
+    assert row == original
+
+
 @pytest.mark.unit
 def test_qmt_broker_get_trades_mapping(monkeypatch):
     broker = QmtBroker(account_id="demo")
