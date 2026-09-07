@@ -540,6 +540,58 @@ MIGRATIONS: Tuple[Migration, ...] = (
             ),
         ),
     ),
+    # No table has a foreign key referencing fills; preserve every existing row.
+    Migration(
+        10,
+        "explicit_zero_fallback_fill_prices",
+        (
+            """
+            CREATE TABLE fills_v10 (
+                fill_id TEXT PRIMARY KEY,
+                order_id TEXT NOT NULL REFERENCES strategy_orders(order_id),
+                broker_trade_id TEXT,
+                fill_fingerprint TEXT NOT NULL UNIQUE,
+                security TEXT NOT NULL,
+                side TEXT NOT NULL CHECK (side IN ('BUY','SELL')),
+                quantity INTEGER NOT NULL CHECK (typeof(quantity) = 'integer' AND quantity > 0),
+                price_units INTEGER NOT NULL CHECK (typeof(price_units) = 'integer'),
+                commission_units INTEGER NOT NULL DEFAULT 0
+                    CHECK (typeof(commission_units) = 'integer' AND commission_units >= 0),
+                tax_units INTEGER NOT NULL DEFAULT 0
+                    CHECK (typeof(tax_units) = 'integer' AND tax_units >= 0),
+                traded_at TEXT NOT NULL,
+                booked_at TEXT NOT NULL,
+                commission_known INTEGER NOT NULL DEFAULT 1 CHECK (commission_known IN (0,1)),
+                tax_known INTEGER NOT NULL DEFAULT 1 CHECK (tax_known IN (0,1)),
+                price_source TEXT NOT NULL DEFAULT 'BROKER_TRADE'
+                    CHECK (price_source IN ('BROKER_TRADE','ORDER_PRICE_FALLBACK','ZERO_FALLBACK')),
+                price_known INTEGER NOT NULL DEFAULT 1 CHECK (price_known IN (0,1)),
+                CHECK (
+                    (price_source = 'ZERO_FALLBACK' AND price_units = 0 AND price_known = 0)
+                    OR (price_source = 'ORDER_PRICE_FALLBACK' AND price_units > 0 AND price_known = 0)
+                    OR (price_source = 'BROKER_TRADE' AND price_units > 0 AND price_known = 1)
+                )
+            )
+            """,
+            """
+            INSERT INTO fills_v10 (
+                fill_id, order_id, broker_trade_id, fill_fingerprint, security, side,
+                quantity, price_units, commission_units, tax_units, traded_at, booked_at,
+                commission_known, tax_known, price_source, price_known
+            )
+            SELECT fill_id, order_id, broker_trade_id, fill_fingerprint, security, side,
+                   quantity, price_units, commission_units, tax_units, traded_at, booked_at,
+                   commission_known, tax_known, price_source, price_known FROM fills
+            """,
+            "DROP TABLE fills",
+            "ALTER TABLE fills_v10 RENAME TO fills",
+            (
+                "CREATE INDEX idx_fills_broker_trade_id_day "
+                "ON fills(substr(traded_at, 1, 10), broker_trade_id) "
+                "WHERE broker_trade_id IS NOT NULL"
+            ),
+        ),
+    ),
 )
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1].version

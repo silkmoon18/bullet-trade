@@ -132,6 +132,44 @@ def test_version_one_database_upgrades_to_latest(tmp_path):
         connection.close()
 
 
+def test_zero_price_migration_preserves_existing_fill_rows_and_constraints(tmp_path):
+    connection = connect_database(tmp_path / "v9.db")
+    try:
+        apply_migrations(connection, target_version=9)
+        _insert_account(connection)
+        connection.execute("""
+            INSERT INTO strategy_orders(order_id, strategy_account_id, client_tag,
+                security, side, requested_qty, state, trading_day, created_at, updated_at)
+            VALUES ('o', 'good-etf', 'tag', '510050.XSHG', 'BUY', 1000, 'FILLED',
+                '2026-09-07', '2026-09-07', '2026-09-07')
+        """)
+        for suffix, source, known in [("real", "BROKER_TRADE", 1), ("estimated", "ORDER_PRICE_FALLBACK", 0)]:
+            connection.execute("""
+                INSERT INTO fills(fill_id, order_id, broker_trade_id, fill_fingerprint,
+                    security, side, quantity, price_units, commission_units, tax_units,
+                    traded_at, booked_at, commission_known, tax_known, price_source, price_known)
+                VALUES (?, 'o', ?, ?, '510050.XSHG', 'BUY', 100, 2000000, 0, 0,
+                    '2026-09-07T10:00:00+08:00', '2026-09-07', 0, 0, ?, ?)
+            """, (suffix, suffix, suffix, source, known))
+        before = [tuple(row) for row in connection.execute("SELECT * FROM fills ORDER BY fill_id")]
+        assert apply_migrations(connection) == LATEST_SCHEMA_VERSION
+        assert [tuple(row) for row in connection.execute("SELECT * FROM fills ORDER BY fill_id")] == before
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert "idx_fills_broker_trade_id_day" in {row[1] for row in connection.execute("PRAGMA index_list(fills)")}
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute("UPDATE fills SET price_units = 0 WHERE fill_id = 'real'")
+        connection.execute("UPDATE fills SET price_units = 0, price_source = 'ZERO_FALLBACK', price_known = 0 WHERE fill_id = 'real'")
+        for changes in ("price_known = 1", "price_units = -1", "price_units = 1", "quantity = 0", "order_id = 'absent'"):
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute("UPDATE fills SET " + changes + " WHERE fill_id = 'real'")
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute("UPDATE fills SET fill_fingerprint = 'estimated' WHERE fill_id = 'real'")
+        assert apply_migrations(connection) == LATEST_SCHEMA_VERSION
+    finally:
+        connection.close()
+
+
 def test_database_constraints_reject_invalid_balances_state_and_float(tmp_path):
     connection = connect_database(tmp_path / "constraints.db")
     try:

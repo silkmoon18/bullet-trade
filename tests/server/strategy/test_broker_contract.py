@@ -323,6 +323,44 @@ def test_conservative_policy_rejects_partial_order_price_fallback():
 
 
 @pytest.mark.parametrize(
+    "price, balance, order_price, expected_price, source",
+    [
+        (2.5, 260, 2.7, 2_500_000, FillPriceSource.BROKER_TRADE),
+        (0, 260, 2.7, 2_600_000, FillPriceSource.BROKER_TRADE),
+        (0, 0, 2.7, 2_700_000, FillPriceSource.ORDER_PRICE_FALLBACK),
+        (0, 0, 0, 0, FillPriceSource.ZERO_FALLBACK),
+        (None, None, None, 0, FillPriceSource.ZERO_FALLBACK),
+    ],
+)
+def test_zero_fallback_is_last_resort(price, balance, order_price, expected_price, source):
+    trade = {
+        "trade_id": "T-zero", "trade_id_source": "broker", "order_id": "O-1",
+        "security": "510050.XSHG", "amount": 100, "side": "SELL",
+        "price": price, "deal_balance": balance, "time": "2026-09-07 10:00:00",
+    }
+    evidence = normalize_trade_evidence(trade, {
+        "O-1": {"amount": 100, "filled": 100, "order_price": order_price},
+    }, UnpricedFillPolicy.ZERO_FALLBACK)
+    assert evidence.price_units == expected_price
+    assert evidence.price_source is source
+    assert evidence.price_known is (source is FillPriceSource.BROKER_TRADE)
+    assert evidence.commission_units is None
+    assert evidence.tax_units is None
+
+
+@pytest.mark.parametrize("field, value", [("amount", 0), ("trade_id", ""), ("order_id", ""), ("side", "")])
+def test_zero_fallback_does_not_invent_non_price_evidence(field, value):
+    trade = {
+        "trade_id": "T-zero", "trade_id_source": "broker", "order_id": "O-1",
+        "security": "510050.XSHG", "amount": 100, "side": "SELL",
+        "price": 0, "time": "2026-09-07 10:00:00",
+    }
+    trade[field] = value
+    with pytest.raises(BrokerContractError):
+        normalize_trade_evidence(trade, {}, UnpricedFillPolicy.ZERO_FALLBACK)
+
+
+@pytest.mark.parametrize(
     "fee_field, fee_value",
     [("commission_fee", -1), ("tax", "-0.1")],
 )

@@ -19,14 +19,15 @@ def test_strategy_enabled_ids_are_parsed_and_deduplicated(monkeypatch):
     ]
 
 
-def test_unpriced_fill_policy_is_validated(monkeypatch):
+@pytest.mark.parametrize("policy", ["strict", "conservative_order_price", "zero_fallback"])
+def test_unpriced_fill_policy_is_validated(monkeypatch, policy):
     monkeypatch.setenv(
         "QMT_STRATEGY_UNPRICED_FILL_POLICY",
-        "conservative_order_price",
+        policy,
     )
     assert (
         build_server_config(SimpleNamespace()).strategy_unpriced_fill_policy
-        == "CONSERVATIVE_ORDER_PRICE"
+        == policy.upper()
     )
 
     monkeypatch.setenv("QMT_STRATEGY_UNPRICED_FILL_POLICY", "guess")

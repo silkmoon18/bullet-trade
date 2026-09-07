@@ -50,6 +50,8 @@ SQLite 中保存已收到的委托/成交回调及查询结果，对账自动合
 
 佣金以QMT/券商明确返回的数据为最终依据。迅投标准股票`XtTrade`提供`traded_id`、成交量、成交价和成交金额，但官方结构没有佣金字段；`used_commission`属于期货持仓统计字段，不能预设为股票逐笔成交佣金。部分柜台或扩展版本可能在成交或`query_data(..., data_type='deal')`中补充费用，服务器会兼容读取；买入费用缓冲只用于下单前现金预留，不是最终佣金。字段缺失时佣金和税费记为未知，不伪造为0，也不阻断委托与成交入账；此时现金、持仓和资产是暂估值，精确`fees/NAV/returns/PnL`保持未知。
 
+模拟柜台连成交价、成交金额和可用委托价都缺失时，可在服务器`.data/.env`设置`QMT_STRATEGY_UNPRICED_FILL_POLICY=ZERO_FALLBACK`：按0价记录成交并更新实际成交数量，保留`price_known=false`，通知明确说明“非真实成交价”。卖出不增加本金现金，买入不扣本金，已知费用仍扣除，未知费用不变；因此资金、成本和收益失真，精确收益指标仍不可用，后续调仓资金及成本风控也可能受影响。默认`STRICT`和原`CONSERVATIVE_ORDER_PRICE`不变。详见[零价兜底说明](26-zero-price-fallback.md)，不建议用于要求精确账本的真实账户。
+
 复制[直连xtquant能力证明模板](xtquant-capabilities.example.json)到`.data`，只把实际证明为真的字段改为`true`，填写真实报告路径和lookback天数。订单归属、稳定ID、成交关联、方向映射、状态与查询等执行必需项为false时服务器会拒绝加载；`fee_fields=false`允许运行，但绩效费用维持未知。不能靠代码猜值或补零。
 
 ## 3. 首次只读启动

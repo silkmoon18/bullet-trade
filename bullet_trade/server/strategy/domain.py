@@ -59,11 +59,13 @@ class OrderState(str, Enum):
 class FillPriceSource(str, Enum):
     BROKER_TRADE = "BROKER_TRADE"
     ORDER_PRICE_FALLBACK = "ORDER_PRICE_FALLBACK"
+    ZERO_FALLBACK = "ZERO_FALLBACK"
 
 
 class UnpricedFillPolicy(str, Enum):
     STRICT = "STRICT"
     CONSERVATIVE_ORDER_PRICE = "CONSERVATIVE_ORDER_PRICE"
+    ZERO_FALLBACK = "ZERO_FALLBACK"
 
 
 class ReconciliationState(str, Enum):
@@ -289,7 +291,10 @@ class BrokerFill:
 
     def __post_init__(self) -> None:
         _require_int(self.quantity, "quantity", minimum=1)
-        _require_int(self.price_units, "price_units", minimum=1)
+        zero_fallback = self.price_source is FillPriceSource.ZERO_FALLBACK
+        _require_int(self.price_units, "price_units", minimum=0 if zero_fallback else 1)
+        if zero_fallback and self.price_units != 0:
+            raise ValueError("ZERO_FALLBACK price must be zero")
         if self.commission_units is not None:
             _require_int(self.commission_units, "commission_units")
         if self.tax_units is not None:

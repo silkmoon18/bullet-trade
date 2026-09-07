@@ -2,6 +2,8 @@ import asyncio
 from dataclasses import replace
 from datetime import date, datetime
 
+import pytest
+
 from bullet_trade.server.strategy import (
     BrokerAccountSnapshot,
     BrokerCapabilityProfile,
@@ -356,6 +358,57 @@ def test_qmt_order_and_trade_ids_can_be_reused_on_a_later_trading_day(tmp_path):
         ("2026-08-11", "trade-1"),
         ("2026-08-12", "trade-1"),
     ]
+
+
+@pytest.mark.parametrize("side", [OrderSide.BUY, OrderSide.SELL])
+@pytest.mark.parametrize("known_fee", [False, True])
+def test_zero_fallback_books_quantity_and_only_known_fees_once(tmp_path, side, known_fee):
+    database, repository, capital, reconciliation = _services(tmp_path, UnpricedFillPolicy.ZERO_FALLBACK)
+    booking = SQLiteFillBookingService(database)
+    expected_cash = money_to_units("10000")
+    if side is OrderSide.SELL:
+        booking.register_order(_order())
+        capital.reserve_cash(ACCOUNT_ID, money_to_units("2100"), 0, "buy-1")
+        assert reconciliation.synchronize(ACCOUNT_ID, PHYSICAL_ID, _snapshot(
+            "17995", positions=(BrokerPositionSnapshot(SECURITY, 1000, 0),),
+            orders=(_broker_order(),), trades=(_broker_trade(),),
+        )).state is ReconciliationState.READY
+        expected_cash = money_to_units("7995")
+    local = replace(_order("zero-order", "broker-zero"), side=side,
+                    trading_day=date(2026, 8, 12), limit_price_units=None)
+    booking.register_order(local)
+    if side is OrderSide.BUY:
+        capital.reserve_cash(ACCOUNT_ID, money_to_units("2100"), 0, local.order_id)
+    order = dict(_broker_order(), order_id=local.broker_order_id, side=side.value,
+                 is_buy=side is OrderSide.BUY, order_time="2026-08-12 09:30:00",
+                 amount=1000, filled=1000, order_price=0)
+    trade = dict(_broker_trade(), trade_id="zero-trade", order_id=local.broker_order_id,
+                 side=side.value, price=0, deal_balance=0, time="2026-08-12 09:30:01",
+                 commission_known=known_fee, tax_known=known_fee)
+    expected_cash -= money_to_units("5") if known_fee else 0
+    positions = (BrokerPositionSnapshot(SECURITY, 1000, 0),) if side is OrderSide.BUY else ()
+    snapshot = _snapshot("20000", positions=positions, orders=(order,), trades=(trade,), day=date(2026, 8, 12))
+    for attempt in range(2):
+        result = reconciliation.synchronize(ACCOUNT_ID, PHYSICAL_ID, snapshot)
+        assert result.state is ReconciliationState.READY
+        assert result.details["booked_trade_ids"] == (("zero-trade",) if attempt == 0 else ())
+        account = repository.get_strategy_account(ACCOUNT_ID)
+        assert account.cash_units == expected_cash
+        assert account.reserved_cash_units == 0
+        assert repository.replay_account(ACCOUNT_ID) == account
+    db = connect_database(database)
+    try:
+        row = db.execute("SELECT price_units, price_source, price_known, commission_known, tax_known FROM fills WHERE broker_trade_id = 'zero-trade'").fetchone()
+        assert tuple(row) == (0, "ZERO_FALLBACK", 0, int(known_fee), int(known_fee))
+        assert db.execute("SELECT total_qty FROM positions").fetchone()[0] == (1000 if side is OrderSide.BUY else 0)
+    finally:
+        db.close()
+    # Zero booking does not silently replace earlier ledger entries if the broker
+    # later supplies a different price. An explicit correction is still required.
+    trade["price"] = 2.1
+    changed = reconciliation.synchronize(ACCOUNT_ID, PHYSICAL_ID, snapshot)
+    assert changed.state is ReconciliationState.BLOCKED
+    assert repository.get_strategy_account(ACCOUNT_ID).cash_units == expected_cash
 
 
 def test_zero_order_id_trade_is_relinked_by_strategy_client_tag(tmp_path):

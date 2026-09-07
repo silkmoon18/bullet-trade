@@ -188,7 +188,8 @@ def test_unknown_fill_fee_disables_only_performance_metrics(ledger_services):
     assert payload["total_pnl"] is None
 
 
-def test_estimated_fill_price_blocks_performance(ledger_services):
+@pytest.mark.parametrize("source", [FillPriceSource.ORDER_PRICE_FALLBACK, FillPriceSource.ZERO_FALLBACK])
+def test_estimated_fill_price_blocks_performance(ledger_services, source):
     _, _, capital, booking, valuation = ledger_services
     booking.register_order(_order("buy-estimated", OrderSide.BUY, 1000))
     capital.reserve_cash(
@@ -205,11 +206,11 @@ def test_estimated_fill_price_blocks_performance(ledger_services):
         security=original.security,
         side=original.side,
         quantity=original.quantity,
-        price_units=original.price_units,
+        price_units=0 if source is FillPriceSource.ZERO_FALLBACK else original.price_units,
         commission_units=original.commission_units,
         tax_units=original.tax_units,
         traded_at=original.traded_at,
-        price_source=FillPriceSource.ORDER_PRICE_FALLBACK,
+        price_source=source,
         price_known=False,
     )
     booking.book_fill(

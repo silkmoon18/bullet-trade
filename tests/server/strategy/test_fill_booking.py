@@ -7,6 +7,7 @@ from bullet_trade.server.strategy import (
     BrokerFill,
     BrokerOrder,
     FillConflictError,
+    FillPriceSource,
     LedgerInvariantError,
     OrderSide,
     OrderState,
@@ -136,6 +137,34 @@ def test_partial_buy_uses_real_fill_and_cancel_releases_only_remainder(services)
     assert canceled.account.cash_units == money_to_units("7995")
     assert canceled.account.available_cash_units == money_to_units("7995")
     assert repository.replay_account("good-etf") == canceled.account
+
+
+def test_zero_fallback_partial_buy_notifies_unknown_and_preserves_remainder_reservation(services):
+    _, capital, original_booking = services
+    notifications = []
+    booking = SQLiteFillBookingService(original_booking.database_path, notifications.append)
+    booking.register_order(_order("zero-buy", OrderSide.BUY, 200))
+    capital.reserve_cash("good-etf", money_to_units("405"), 0, "zero-buy")
+    fill = replace(_fill("zero-fill", "zero-buy", OrderSide.BUY, 100),
+                   price_units=0, price_source=FillPriceSource.ZERO_FALLBACK,
+                   price_known=False, commission_units=None, tax_units=None)
+    result = booking.book_fill("good-etf", fill, 1, sellable_from_trade_date=date(2026, 8, 11))
+    assert result.account.cash_units == money_to_units("10000")
+    assert result.account.reserved_cash_units == money_to_units("405")
+    assert result.position.total_qty == 100
+    assert result.position.avg_cost_price_units == 0
+    assert result.order_state is OrderState.PARTIALLY_FILLED
+    notice = notifications[-1]
+    assert str(notice.price) == "0"
+    assert str(notice.amount) == "0"
+    assert notice.quantity == 100
+    assert "按0记账（非真实成交价）" in notice.detail
+    assert "佣金 未知" in notice.detail and "税费 未知" in notice.detail
+    assert booking.book_fill("good-etf", fill, result.account.ledger_version,
+                             sellable_from_trade_date=date(2026, 8, 11)).duplicate
+    assert len(notifications) == 2  # Submit + first fill only.
+    canceled = booking.finalize_order("good-etf", "zero-buy", OrderState.CANCELED, result.account.ledger_version)
+    assert canceled.released_cash_units == money_to_units("405")
 
 
 def test_t0_buy_is_sellable_on_acquisition_day(services):

@@ -21,6 +21,7 @@ from .domain import (
     SHANGHAI_TZ,
     BrokerFill,
     BrokerOrder,
+    FillPriceSource,
     OrderSide,
     OrderState,
     Position,
@@ -92,7 +93,9 @@ def _fee_notification_detail(fill: BrokerFill) -> str:
     )
     if fill.commission_units is None or fill.tax_units is None:
         detail += "；成交金额仅计已知费用"
-    if not fill.price_known:
+    if fill.price_source is FillPriceSource.ZERO_FALLBACK:
+        detail += "；成交价和可用估价缺失，按0记账（非真实成交价），资金/收益不准确"
+    elif not fill.price_known:
         detail += "；成交价缺失，使用委托保护价保守估算"
     return detail
 
@@ -468,7 +471,10 @@ class SQLiteFillBookingService:
                     cast(date, sellable_from_trade_date),
                 )
             else:
-                if gross_units < fee_units:
+                if (
+                    gross_units < fee_units
+                    and fill.price_source is not FillPriceSource.ZERO_FALLBACK
+                ):
                     raise LedgerInvariantError("sell fees exceed trade value")
                 cash_delta = gross_units - fee_units
                 reservation_released = 0

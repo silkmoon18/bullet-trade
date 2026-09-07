@@ -87,10 +87,10 @@ def _split_items(raw: Optional[str]) -> List[str]:
 
 def _unpriced_fill_policy(raw: Optional[str]) -> str:
     value = str(raw or "STRICT").strip().upper()
-    if value not in ("STRICT", "CONSERVATIVE_ORDER_PRICE"):
+    if value not in ("STRICT", "CONSERVATIVE_ORDER_PRICE", "ZERO_FALLBACK"):
         raise ValueError(
             "QMT_STRATEGY_UNPRICED_FILL_POLICY must be "
-            "STRICT or CONSERVATIVE_ORDER_PRICE"
+            "STRICT, CONSERVATIVE_ORDER_PRICE or ZERO_FALLBACK"
         )
     return value
 

@@ -212,8 +212,11 @@ class BrokerTradeEvidence:
             raise ValueError("broker trade identifiers and security cannot be empty")
         if type(self.quantity) is not int or self.quantity <= 0:
             raise ValueError("broker trade quantity must be a positive integer")
-        if type(self.price_units) is not int or self.price_units <= 0:
-            raise ValueError("broker trade price must be a positive integer")
+        zero_fallback = self.price_source is FillPriceSource.ZERO_FALLBACK
+        if type(self.price_units) is not int or (
+            self.price_units != 0 if zero_fallback else self.price_units <= 0
+        ):
+            raise ValueError("broker trade price must be positive, or explicit ZERO_FALLBACK")
         if self.commission_units is not None and (
             type(self.commission_units) is not int or self.commission_units < 0
         ):
@@ -431,8 +434,9 @@ def normalize_trade_evidence(
         price_units = _price_from_deal_balance(trade, quantity)
     price_source = FillPriceSource.BROKER_TRADE
     price_known = True
-    if price_units is None and (
-        unpriced_fill_policy is UnpricedFillPolicy.CONSERVATIVE_ORDER_PRICE
+    if price_units is None and unpriced_fill_policy in (
+        UnpricedFillPolicy.CONSERVATIVE_ORDER_PRICE,
+        UnpricedFillPolicy.ZERO_FALLBACK,
     ):
         price_units = _conservative_order_price(
             orders_by_id.get(order_id), quantity
@@ -440,6 +444,10 @@ def normalize_trade_evidence(
         if price_units is not None:
             price_source = FillPriceSource.ORDER_PRICE_FALLBACK
             price_known = False
+    if price_units is None and unpriced_fill_policy is UnpricedFillPolicy.ZERO_FALLBACK:
+        price_units = 0
+        price_source = FillPriceSource.ZERO_FALLBACK
+        price_known = False
     if price_units is None:
         raise BrokerContractError(
             "broker trade price is invalid; security={}; "

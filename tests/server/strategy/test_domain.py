@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -6,6 +7,7 @@ import pytest
 from bullet_trade.server.strategy.domain import (
     MONEY_SCALE,
     BrokerFill,
+    FillPriceSource,
     OrderSide,
     PortfolioIntent,
     Position,
@@ -72,6 +74,16 @@ def test_position_and_fill_invariants():
     )
     assert fill.traded_at.tzinfo == SHANGHAI_TZ
     assert fill.traded_at.hour == 9
+    zero = replace(fill, price_units=0, price_source=FillPriceSource.ZERO_FALLBACK, price_known=False)
+    assert zero.price_units == 0
+    for changes in (
+        {"price_units": 0},
+        {"price_units": -1},
+        {"price_source": FillPriceSource.ZERO_FALLBACK, "price_known": False},
+        {"price_units": 0, "price_source": FillPriceSource.ZERO_FALLBACK, "price_known": True},
+    ):
+        with pytest.raises(ValueError):
+            replace(fill, **changes)
     with pytest.raises(ValueError, match="quantity"):
         BrokerFill(
             fill_id="fill-1",
