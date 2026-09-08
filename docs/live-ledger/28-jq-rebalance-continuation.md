@@ -30,7 +30,7 @@
 
 ## 更新步骤
 
-本轮仅本地修复，未推送、未部署、未修改聚宽或服务器交易配置，也未重算历史资金。
+实现验收阶段仅本地修复，未推送或部署；随后按用户“部署”指令同步代码，结果见下。没有修改聚宽或服务器交易配置，也未重算历史资金。
 
 导出包：`dist/joinquant-20260908-api19/`，源码与导出物SHA256一致；本机私有配置通过校验，但未被复制进导出包。
 
@@ -41,3 +41,13 @@
 5. 使用分钟级回测/模拟交易，重新启动；核对`helper API=19 marker=bullet-trade-joinquant-runtime-helper-v19`。当天观察“等待卖出→减仓已确认→调仓已完成”，尾盘仍未完成时会显示SELL或BUY，不再伪装成已完成。
 
 港股过滤无需另加一套规则：本次上传的helper已经包含HK及513320显式排除，原有契约测试确认不会改变剩余标的的排序和权重算法。聚宽端是否确实加载新文件，仍需用户上传重启后通过日志确认；本地通过不等于平台已部署。
+
+## 2026-09-08代码同步结果
+
+- `6071765`已推送到个人fork的`codex/joinquant-execution-modes`；服务器`C:\Users\Administrator\dev\bullet-trade_baihua`从`a465f68`快进到该提交，工作区干净。
+- 更新前确认`bullet_trade/`与`scripts/`均无差异，本次仅为聚宽helper、薄入口、测试及文档变化。因此没有停服或重启，服务仍为PID3500，QMT仍为XtMiniQmt PID4228。
+- 服务器聚宽单文件导出校验通过。本地API19上传包与本地源码一致，私有配置校验通过且未复制到上传包。
+- `.data/.env`、`xtquant-capabilities.json`更新前后哈希一致。交易保持true，白名单仍只有`good_etf_remote`。未迁移数据库、修改账本、下单、撤单或调整资金。
+- 23:26只读验收：58620服务在线，任务Running，QMT ready、broker connected、strategy_ledger_ready=true；数据库schema11，最新对账READY、blockers为0、活动委托为0。
+- 旧上游目录仍为`cd42a97`，已有`logs/app.log`修改及`command.txt`未跟踪状态未变，未写入旧目录。
+- **聚宽尚未更新**：沿用用户自行操作聚宽的决定，没有登录或修改聚宽策略。须按上面的步骤更新两份API19文件并重启，JQ分阶段调仓修复才会生效。服务器代码同步不能代替聚宽上传。
