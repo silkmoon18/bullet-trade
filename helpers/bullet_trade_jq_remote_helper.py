@@ -84,8 +84,8 @@ __all__ = [
     "runtime_order_target_value",
 ]
 
-STRATEGY_RUNTIME_API_VERSION = 18
-STRATEGY_RUNTIME_HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v18"
+STRATEGY_RUNTIME_API_VERSION = 19
+STRATEGY_RUNTIME_HELPER_MARKER = "bullet-trade-joinquant-runtime-helper-v19"
 PROFILE_SCHEMA_VERSION = 3
 EXECUTION_WIRE_SCHEMA_VERSION = 2
 HONG_KONG_ETF_KEYWORDS = (
@@ -1420,7 +1420,10 @@ def install_strategy_runtime(
         or expected_api_version != STRATEGY_RUNTIME_API_VERSION
     ):
         raise RuntimeError(
-            "helper运行时API版本不匹配: expected={}".format(STRATEGY_RUNTIME_API_VERSION)
+            "helper运行时API版本不匹配：策略要求={}，实际helper={}；"
+            "请同时更新策略和研究根目录helper并重启".format(
+                expected_api_version, STRATEGY_RUNTIME_API_VERSION,
+            )
         )
     mode = _normalise_runtime_mode(mode)
     if type(validate_remote) is not bool:
@@ -1566,6 +1569,10 @@ class JoinQuantRuntime:
         self._namespace = namespace
         self._qmt_initial_capital = qmt_initial_capital
         self._qmt_readiness_attempted = False
+        # Only plain values live in g: JQ can pickle them across worker restarts.
+        self._jq_plan = getattr((namespace or {}).get("g"), "bt_jq_plan", None)
+        if self._jq_plan and self._jq_plan.get("strategy_id") != state.get("strategy_id"):
+            self._jq_plan = None
 
     def _set_qmt_ready(self, ready: bool) -> None:
         global _active_state
@@ -1690,8 +1697,10 @@ class JoinQuantRuntime:
     def log_process_initialize(self) -> None:
         self._log(
             "info",
-            "process_initialize 重建配置 {}".format(
-                time.strftime("%Y-%m-%d %H:%M:%S")
+            "process_initialize 重建配置 {} | helper API={} marker={}".format(
+                time.strftime("%Y-%m-%d %H:%M:%S"),
+                STRATEGY_RUNTIME_API_VERSION,
+                STRATEGY_RUNTIME_HELPER_MARKER,
             ),
         )
 
@@ -1753,6 +1762,10 @@ class JoinQuantRuntime:
                     portfolio.positions_value,
                 )
             self._log("info", fund_message)
+            if account == "JQ" and self._jq_plan:
+                self._log("info", "JQ调仓状态 | 交易日={} 状态={}".format(
+                    self._jq_plan["day"], self._jq_plan["phase"],
+                ))
             for security in sorted(portfolio.positions):
                 position = portfolio.positions[security]
                 market_detail = ""
@@ -2084,23 +2097,8 @@ class JoinQuantRuntime:
                         notification_items,
                         occurred_at=getattr(context, "current_dt", None),
                     )
-                self.cancel_orders()
-                selected = set(weights)
-                for security in list(jq_portfolio.positions.keys()):
-                    if security not in selected:
-                        order_obj = self.order_target(security, 0)
-                        result["jq_orders"].append(
-                            (security, 0.0, order_obj)
-                        )
-                planning_total = float(jq_portfolio.total_value)
-                for security, raw_weight in weights.items():
-                    target_value = planning_total * float(raw_weight)
-                    order_obj = self.order_target_value(
-                        security, target_value
-                    )
-                    result["jq_orders"].append(
-                        (security, target_value, order_obj)
-                    )
+                self._start_jq_rebalance(context, weights, marks, idempotency_key)
+                result["jq_orders"] = self._advance_jq_rebalance(context)
             except Exception as exc:
                 result["errors"].append(("JQ", str(exc)))
                 self._log(
@@ -2124,15 +2122,6 @@ class JoinQuantRuntime:
             "skipped_active_intent"
         ):
             self._log("info", "QMT仍有活动目标，本轮仅继续推进原目标")
-        for security, target_value, order_result in result["jq_orders"]:
-            self._log(
-                "info",
-                "JQ目标已提交 | {} 目标市值={:.2f} order_id={}".format(
-                    _security_label(security),
-                    target_value,
-                    getattr(order_result, "order_id", None),
-                ),
-            )
         if result["errors"]:
             self._log(
                 "warn",
@@ -2152,6 +2141,163 @@ class JoinQuantRuntime:
                 ),
             )
         return result
+
+    def _save_jq_plan(self, plan: Dict[str, Any]) -> None:
+        self._jq_plan = plan
+        global_state = (self._namespace or {}).get("g")
+        if global_state is not None:
+            setattr(global_state, "bt_jq_plan", plan)
+
+    def _start_jq_rebalance(self, context, weights, marks, key):
+        parts = _strategy_clock_parts(context.current_dt)
+        if parts is None:
+            raise RuntimeError("JQ调仓策略时间不可识别")
+        day = "{:04d}-{:02d}-{:02d}".format(*parts[:3])
+        old = self._jq_plan
+        if old and old["day"] == day and old["key"] == key:
+            return
+        self.cancel_orders()
+        total = float(context.portfolio.total_value)
+        targets = {
+            security: 0.0 for security in context.portfolio.positions
+            if security not in weights
+        }
+        targets.update({
+            security: total * float(weight) for security, weight in weights.items()
+        })
+        self._save_jq_plan({
+            "strategy_id": self.state.get("strategy_id"), "day": day, "key": key,
+            "targets": targets, "marks": dict(marks), "phase": "SELL",
+            "done": [], "order_ids": [], "last_bar": None,
+        })
+        self._log("info", "JQ调仓开始 | 先卖后买 | 目标数={}".format(len(weights)))
+
+    def _jq_gap(self, context, security, target):
+        position = context.portfolio.positions.get(security)
+        if target == 0:
+            held = float(getattr(position, "total_amount", 0.0) or 0.0)
+            return (-1.0 if held > 0 else 0.0), 0.0, position
+        price = float(getattr(position, "price", 0.0) or 0.0)
+        current_data = (self._namespace or {}).get("get_current_data")
+        if callable(current_data):
+            quote = current_data()[security]
+            price = float(getattr(quote, "last_price", 0.0) or price)
+        if not math.isfinite(price) or price <= 0:
+            price = float(self._jq_plan["marks"].get(security, 0.0))
+        if not math.isfinite(price) or price <= 0:
+            raise RuntimeError("JQ调仓缺少有效价格：{}".format(_security_label(security)))
+        quantity = getattr(position, "total_amount", None)
+        value = (
+            float(quantity) * price if quantity is not None
+            else self._position_value(position, price)
+        )
+        return target - value, 100 * price, position
+
+    def _cancel_jq_plan(self, reason: str) -> None:
+        plan = self._jq_plan
+        if not plan or plan["phase"] in ("COMPLETED", "CANCELED", "EXPIRED"):
+            return
+        plan["phase"] = "EXPIRED" if reason == "跨日过期" else "CANCELED"
+        self._save_jq_plan(plan)
+        for order in list((self._platform_api("get_open_orders")() or {}).values()):
+            if str(getattr(order, "order_id", "")) in plan["order_ids"]:
+                self._platform_api("cancel_order")(order)
+        self._log("info", "JQ调仓停止 | {}".format(reason))
+
+    def on_bar(self, context: Any) -> None:
+        """Thin platform callback: resume JQ only, never issue QMT RPCs."""
+        try:
+            self._advance_jq_rebalance(context)
+        except Exception as exc:
+            self._log("error", "JQ调仓续行异常：{}".format(exc))
+
+    def _advance_jq_rebalance(self, context):
+        plan = self._jq_plan
+        if not self.jq_account_enabled or not plan:
+            return []
+        if plan["phase"] in ("COMPLETED", "CANCELED", "EXPIRED"):
+            return []
+        parts = _strategy_clock_parts(context.current_dt)
+        if parts is None:
+            raise RuntimeError("JQ调仓策略时间不可识别")
+        if "{:04d}-{:02d}-{:02d}".format(*parts[:3]) != plan["day"]:
+            self._cancel_jq_plan("跨日过期")
+            return []
+        minute = parts[3] * 60 + parts[4]
+        if not (9 * 60 + 30 <= minute < 11 * 60 + 30 or 13 * 60 <= minute < 15 * 60):
+            return []
+        bar = list(parts[:5])
+        if plan["last_bar"] == bar:
+            return []
+        plan["last_bar"] = bar
+        self._save_jq_plan(plan)
+        submitted = []
+
+        def active_securities():
+            return {
+                getattr(order, "security", "") for order in
+                (self._platform_api("get_open_orders")() or {}).values()
+            }
+
+        def place(security, target):
+            order = (
+                self.order_target(security, 0) if target == 0
+                else self.order_target_value(security, target)
+            )
+            order_id = getattr(order, "order_id", None)
+            if order_id is not None and str(order_id) not in plan["order_ids"]:
+                plan["order_ids"].append(str(order_id))
+            submitted.append((security, target, order))
+            self._save_jq_plan(plan)
+            self._log("info", "JQ目标已提交 | {} 目标市值={:.2f} order_id={}".format(
+                _security_label(security), target, order_id,
+            ))
+
+        if plan["phase"] == "SELL":
+            active = active_securities()
+            for security, target in plan["targets"].items():
+                gap, lot_value, position = self._jq_gap(context, security, target)
+                if gap >= 0 or gap > -lot_value + 1e-6 or security in active:
+                    continue
+                if getattr(position, "closeable_amount", 1) <= 0:
+                    continue
+                place(security, target)
+            active = active_securities()
+            waiting = []
+            for security, target in plan["targets"].items():
+                gap, lot_value, _ = self._jq_gap(context, security, target)
+                if (gap < 0 and gap <= -lot_value + 1e-6) or security in active:
+                    waiting.append(security)
+            if waiting:
+                if plan.get("waiting") != waiting:
+                    self._log("info", "JQ调仓等待卖出 | {} | 下一分钟继续，不提前买入".format(
+                        ", ".join(_security_label(s) for s in waiting),
+                    ))
+                    plan["waiting"] = waiting
+                return submitted
+            plan["phase"] = "BUY"
+            self._log("info", "JQ减仓已确认，开始买入")
+
+        active = active_securities()
+        for security, target in plan["targets"].items():
+            if target == 0 or security in plan["done"] or security in active:
+                continue
+            gap, lot_value, _ = self._jq_gap(context, security, target)
+            if gap >= lot_value - 1e-6:
+                place(security, target)
+                gap, lot_value, _ = self._jq_gap(context, security, target)
+            if gap < lot_value - 1e-6:
+                plan["done"].append(security)
+        active = active_securities()
+        completed = all(
+            target == 0 or security in plan["done"]
+            for security, target in plan["targets"].items()
+        )
+        if completed and not (active & set(plan["targets"])):
+            plan["phase"] = "COMPLETED"
+            self._log("info", "JQ调仓已完成 | 实际持仓达到目标整手容差")
+        self._save_jq_plan(plan)
+        return submitted
 
     @staticmethod
     def _risk_exits(
@@ -2278,6 +2424,8 @@ class JoinQuantRuntime:
                     "take_profit": take_profit,
                     "orders": [],
                 }
+                if stop_loss or take_profit:
+                    self._cancel_jq_plan("止盈止损优先，停止旧调仓补买")
                 for security in stop_loss + take_profit:
                     order_obj = self.order_target(security, 0)
                     account_result["orders"].append(

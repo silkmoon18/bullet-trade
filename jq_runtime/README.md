@@ -77,6 +77,14 @@ helper是策略的必需研究文件，缺失时策略在导入阶段直接中�
 
 ## 重载禁令与冷升级
 
+### API19：JQ调仓续行
+
+更新`good_etf.py`与研究根目录`bullet_trade_jq_remote_helper.py`两份文件；两个独立策略各自保留原STRATEGY_ID，私有配置schema仍为3，不要覆盖现有连接或账户开关。重启日志应显示`helper API=19`。
+
+JQ调仓先确认清仓和减仓，再买入；未成交或部分成交的目标通过`handle_data -> runtime.on_bar`继续，活动委托不重复提交。须选择分钟级回测/模拟交易才能每分钟续行。状态保存在`g`，支持同日进程重建，不跨日追单；止盈止损优先停止旧调仓补买。JQ通知形式、QMT执行及历史零价账本不因本次升级改变。
+
+完整上传与验收步骤见[API19修改记录](../docs/live-ledger/28-jq-rebalance-continuation.md)。
+
 helper不支持热重载：生产禁止`importlib.reload()`和热补丁，任何升级都必须冷启动。本helper运行在用户自有的可信策略进程中，不防御同进程任意代码执行（D021）。
 
 安装或运行校验抛出异常后，不得在同一进程重试或改为BACKTEST，应丢弃该进程并以全新进程重新启动。

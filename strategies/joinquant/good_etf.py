@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 STRATEGY_ID = 'good_etf_remote'
 
 VALIDATE_REMOTE_DURING_BACKTEST = True
-_EXPECTED_RUNTIME_API_VERSION = 18
+_EXPECTED_RUNTIME_API_VERSION = 19
 _EXPECTED_RUNTIME_PROFILE_MODULE = 'jq_runtime_config'
 
 # ===== 策略参数 =====
@@ -295,6 +295,11 @@ def market_open(context: 'Context') -> None:
 
     except Exception as e:
         log.error(f"开盘执行异常：{e}")
+
+
+def handle_data(context: 'Context', data: Any) -> None:
+    """聚宽分钟入口；订单续行全部委托运行时。"""
+    _runtime.on_bar(context)
 
 
 def handle_risk_management(context: 'Context') -> None:
