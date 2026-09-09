@@ -58,7 +58,7 @@ class _Runtime:
             real_helper.RuntimeMode.JQ_QMT_PARALLEL,
         )
         self.state = {
-            "api_version": 19,
+            "api_version": 20,
             "strategy_id": "good_etf_remote",
             "mode": mode.value,
         }
@@ -300,7 +300,6 @@ def test_strategy_source_compiles_and_stays_strategy_focused():
         "process_initialize",
         "before_market_open",
         "market_open",
-        "handle_data",
         "handle_risk_management",
         "after_market_check",
     }
@@ -311,17 +310,12 @@ def test_risk_check_times_are_top_level_configuration(monkeypatch):
     assert strategy.RISK_CHECK_TIMES == ("10:30", "13:30", "14:50")
 
 
-def test_handle_data_is_only_a_runtime_delegation(monkeypatch):
+def test_strategy_has_no_minute_order_continuation(monkeypatch):
     strategy = _load_strategy(monkeypatch)
-    calls = []
-    strategy._runtime = types.SimpleNamespace(on_bar=calls.append)
-    context = _Context()
-    strategy.handle_data(context, object())
-    assert calls == [context]
-    tree = ast.parse(STRATEGY_PATH.read_text(encoding="utf-8"))
-    callback = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
-                    and node.name == "handle_data")
-    assert len(callback.body) == 2  # Docstring plus one helper call, no account logic.
+    assert not hasattr(strategy, "handle_data")
+    source = STRATEGY_PATH.read_text(encoding="utf-8")
+    assert "on_bar" not in source and "bt_jq_plan" not in source
+    assert "开盘选股下单完成" not in source
 
 
 def test_runtime_install_is_one_thin_helper_call(monkeypatch):
@@ -334,7 +328,7 @@ def test_runtime_install_is_one_thin_helper_call(monkeypatch):
 
     state = strategy._install_runtime(context)
 
-    assert state == runtime.state
+    assert state is None  # The strategy must not read runtime bookkeeping state.
     assert strategy._runtime is runtime
     namespace, kwargs = calls[0]
     assert namespace is strategy.__dict__
@@ -342,7 +336,7 @@ def test_runtime_install_is_one_thin_helper_call(monkeypatch):
         "context": context,
         "strategy_id": "good_etf_remote",
         "qmt_initial_capital": 10000,
-        "expected_api_version": 19,
+        "expected_api_version": 20,
         "profile_module": "jq_runtime_config",
         "validate_remote_during_backtest": True,
     }

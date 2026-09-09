@@ -936,7 +936,8 @@ def test_async_server_adapter_snapshot_is_supported():
             return {"available_cash": 10000.0}
 
         async def get_positions(self, account):
-            return [{"security": "510050.SH", "amount": 100, "closeable_amount": 50}]
+            return [{"security": "510050.SH", "amount": 100,
+                     "closeable_amount": 50, "name": "上证50ETF"}]
 
         async def list_orders(self, account, filters=None):
             assert filters == {"from_broker": True, "include_history": True}
@@ -955,7 +956,7 @@ def test_async_server_adapter_snapshot_is_supported():
     )
 
     assert snapshot.available_cash_units == money_to_units("10000")
-    assert snapshot.positions == (BrokerPositionSnapshot(SECURITY, 100, 50),)
+    assert snapshot.positions == (BrokerPositionSnapshot(SECURITY, 100, 50, "上证50ETF"),)
 
 
 def test_async_snapshot_keeps_unrelated_signed_qmt_position():

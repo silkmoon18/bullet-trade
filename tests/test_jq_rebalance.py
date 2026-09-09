@@ -1,4 +1,4 @@
-"""JQ market-order continuation, independent of the remote ledger."""
+"""JQ native execution: no server-style follow-up or staged rebalance."""
 
 import importlib
 import pickle
@@ -98,162 +98,83 @@ def start(jq, runtime, weights):
     return runtime.execute_rebalance(jq.context, weights, jq.prices, "open-20260908")
 
 
-def test_failed_exit_blocks_buys_but_target_reduction_also_runs_first(helper):
+@pytest.mark.parametrize("mode", ["JQ", "BACKTEST"])
+def test_native_rebalance_submits_once_without_waiting_for_failed_sell(helper, mode):
     jq = JQ(cash=1000, holdings={"OLD": 400, "TRIM": 500})
     jq.blocked.add("OLD")
     runtime = jq.runtime(helper)
-    start(jq, runtime, {"BUY": 0.5, "TRIM": 0.2})
-    assert jq.calls == [("OLD", 0), ("TRIM", 2000)]
-    assert runtime._jq_plan["phase"] == "SELL"
-    runtime.on_bar(jq.context)  # Same bar must not repeatedly cancel/retry.
-    assert len(jq.calls) == 2
-    jq.blocked.clear()
-    jq.context.current_dt += timedelta(minutes=1)
-    runtime.on_bar(jq.context)
-    assert jq.calls[2:] == [("OLD", 0), ("BUY", 5000)]
-    assert runtime._jq_plan["phase"] == "COMPLETED"
-    assert "OLD" not in jq.positions
-    assert jq.positions["TRIM"].total_amount == 200
-    assert jq.positions["BUY"].total_amount == 500
+    runtime.mode = helper.RuntimeMode(mode)
+    helper._active_state["mode"] = mode
+    result = start(jq, runtime, {"BUY": 0.5, "TRIM": 0.2})
+    # Preserve pre-API19 native call order, even when a sell is canceled:
+    # clear non-targets, then submit selected targets in decision order.
+    assert jq.calls == [("OLD", 0), ("BUY", 5000), ("TRIM", 2000)]
+    assert [s for s, _, _ in result["jq_orders"]] == ["OLD", "BUY", "TRIM"]
+    assert result["errors"] == []
+    assert jq.positions["OLD"].total_amount == 400
+    assert jq.positions["BUY"].total_amount == 100  # Native cash clipping is not supplemented.
+    assert not hasattr(runtime, "on_bar")
+    assert not hasattr(runtime, "_jq_plan")
+    assert not hasattr(jq.g, "bt_jq_plan")
 
 
-def test_active_sell_waits_without_duplicate_then_buy_waits_for_fill(helper):
+def test_pending_sell_does_not_create_a_helper_sell_buy_state_machine(helper):
     jq = JQ(cash=1000, holdings={"OLD": 900})
-    jq.pending = {"OLD", "BUY"}
+    jq.pending.add("OLD")
     runtime = jq.runtime(helper)
     start(jq, runtime, {"BUY": 0.8})
-    jq.context.current_dt += timedelta(minutes=1)
-    runtime.on_bar(jq.context)
-    assert jq.calls == [("OLD", 0)]
-    jq.fill("OLD", -900)
-    jq.open.clear()
-    jq.context.current_dt += timedelta(minutes=1)
-    runtime.on_bar(jq.context)
-    assert jq.calls[-1] == ("BUY", 8000)
-    jq.context.current_dt += timedelta(minutes=1)
-    runtime.on_bar(jq.context)
-    assert len(jq.calls) == 2
-    jq.fill("BUY", 800)
-    jq.open.clear()
-    jq.context.current_dt += timedelta(minutes=1)
-    runtime.on_bar(jq.context)
-    assert runtime._jq_plan["phase"] == "COMPLETED"
+    assert jq.calls == [("OLD", 0), ("BUY", 8000)]
+    assert len(jq.open) == 1  # The native working sell is not canceled by a minute worker.
+    assert jq.positions["BUY"].total_amount == 100
 
 
-def test_partial_buy_resumes_from_pickle_without_chasing_completed_targets(helper):
+def test_partial_buy_is_left_to_native_platform_without_helper_followup(helper):
     jq = JQ()
     jq.partial_once["BUY"] = 100
     runtime = jq.runtime(helper)
     start(jq, runtime, {"BUY": 0.5, "SECOND": 0.4})
     assert jq.positions["BUY"].total_amount == 100
-    assert runtime._jq_plan["phase"] == "BUY"
-    jq.g = pickle.loads(pickle.dumps(jq.g))
-    runtime = jq.runtime(importlib.reload(helper))
-    start(jq, runtime, {"BUY": 0.5, "SECOND": 0.4})
+    assert jq.positions["SECOND"].total_amount == 400
+    jq.context.current_dt += timedelta(minutes=1)
+    restored = jq.runtime(importlib.reload(helper))
     assert len(jq.calls) == 2
-    jq.context.current_dt += timedelta(minutes=1)
-    runtime.on_bar(jq.context)
-    assert jq.positions["BUY"].total_amount == 500
-    assert jq.calls[-1] == ("BUY", 5000)
-    assert runtime._jq_plan["phase"] == "COMPLETED"
-    jq.prices["BUY"] = 5
-    jq.refresh()
-    jq.context.current_dt += timedelta(minutes=1)
-    start(jq, runtime, {"BUY": 0.5, "SECOND": 0.4})
-    runtime.on_bar(jq.context)
-    assert len(jq.calls) == 3  # Same decision cannot rebalance again after completion.
+    assert not hasattr(restored, "on_bar")
+    assert not hasattr(jq.g, "bt_jq_plan")
 
 
-def test_lunch_after_close_and_expiry_never_retry_old_target(helper):
+@pytest.mark.parametrize("phase", ["SELL", "BUY", "COMPLETED"])
+def test_api19_saved_plan_is_ignored_on_upgrade_and_does_not_replay_orders(helper, phase):
     jq = JQ()
-    jq.blocked.add("BUY")
+    jq.g.bt_jq_plan = {"strategy_id": "test", "phase": phase,
+                       "day": "2026-09-08", "key": "open-20260908",
+                       "targets": {"OLD": 999999}, "order_ids": ["old-id"]}
+    jq.g = pickle.loads(pickle.dumps(jq.g))
     runtime = jq.runtime(helper)
-    start(jq, runtime, {"BUY": 0.8})
-    for hour, minute in [(11, 30), (12, 0), (15, 0), (23, 0)]:
-        jq.context.current_dt = jq.context.current_dt.replace(hour=hour, minute=minute)
-        runtime.on_bar(jq.context)
-    assert len(jq.calls) == 1
-    jq.context.current_dt = datetime(2026, 9, 9, 9, 30)
-    runtime.on_bar(jq.context)
-    assert runtime._jq_plan["phase"] == "EXPIRED"
-    assert len(jq.calls) == 1
-
-
-def test_t1_unsellable_position_prevents_buying_a_fourth_position(helper):
-    jq = JQ(cash=5000, holdings={"OLD": 500})
-    jq.positions["OLD"].closeable_amount = 0
-    runtime = jq.runtime(helper)
-    start(jq, runtime, {"BUY": 0.8})
     assert jq.calls == []
-    assert runtime._jq_plan["phase"] == "SELL"
+    start(jq, runtime, {"BUY": 0.5})
+    assert jq.calls == [("BUY", 5000)]
+    assert jq.g.bt_jq_plan["phase"] == phase  # Inert old data, never used as execution state.
+    assert not hasattr(runtime, "_jq_plan")
 
 
-def test_risk_exit_stops_partial_rebalance_from_buying_back(helper):
+def test_none_from_native_order_does_not_start_a_retry_plan(helper):
     jq = JQ()
-    jq.partial_once["BUY"] = 100
     runtime = jq.runtime(helper)
-    start(jq, runtime, {"BUY": 0.8})
-    jq.open["1"] = NS(order_id="1", security="BUY", amount=800, filled=100)
-    jq.positions["BUY"].closeable_amount = 100
+    calls = []
+    helper._active_namespace["order_target_value"] = lambda *args, **kwargs: calls.append(args)
+    result = start(jq, runtime, {"BUY": 0.5, "SECOND": 0.4})
+    assert len(calls) == 2
+    assert all(order is None for _, _, order in result["jq_orders"])
+    assert not hasattr(runtime, "on_bar")
+
+
+def test_risk_exit_still_uses_native_order_without_rebalance_plan(helper):
+    jq = JQ(cash=5000, holdings={"BUY": 500})
     jq.prices["BUY"] = 9
     jq.refresh()
+    runtime = jq.runtime(helper)
     result = runtime.execute_risk_management(jq.context, 0.95, 1.1, "risk")
     assert result["errors"] == []
-    assert runtime._jq_plan["phase"] == "CANCELED"
-    assert jq.open == {}
+    assert jq.calls == [("BUY", 0)]
     assert "BUY" not in jq.positions
-    jq.context.current_dt += timedelta(minutes=1)
-    runtime.on_bar(jq.context)
-    assert len(jq.calls) == 2
-
-
-def test_round_lot_tolerance_does_not_trigger_an_unwanted_extra_sale(helper):
-    jq = JQ(cash=7500, holdings={"TRIM": 250})
-    runtime = jq.runtime(helper)
-    start(jq, runtime, {"TRIM": 0.15})
-    assert jq.calls == [("TRIM", 1500)]  # Exactly one lot reduction.
-    assert runtime._jq_plan["phase"] == "COMPLETED"
-
-
-def test_qmt_only_bar_never_uses_jq_or_remote_order_functions(helper):
-    runtime = helper.JoinQuantRuntime({"mode": "QMT_REMOTE", "jq_account_enabled": False,
-                                      "qmt_account_enabled": True}, {})
-    runtime.on_bar(NS())
-    assert runtime._jq_plan is None
-
-
-def test_selected_buys_keep_weight_order_even_for_existing_positions(helper):
-    jq = JQ(cash=8000, holdings={"SECOND": 200})
-    runtime = jq.runtime(helper)
-    start(jq, runtime, {"BUY": 0.4, "SECOND": 0.5})
-    assert jq.calls == [("BUY", 4000), ("SECOND", 5000)]
-    assert runtime._jq_plan["phase"] == "COMPLETED"
-
-
-def test_insufficient_cash_does_not_mark_a_large_remaining_target_completed(helper):
-    jq = JQ()
-    jq.spendable_limit = 1000
-    runtime = jq.runtime(helper)
-    start(jq, runtime, {"BUY": 0.3})
-    assert runtime._jq_plan["phase"] == "BUY"
-    assert jq.positions["BUY"].total_amount == 100
-    jq.spendable_limit = None
-    jq.context.current_dt += timedelta(minutes=1)
-    runtime.on_bar(jq.context)
-    assert jq.positions["BUY"].total_amount == 300
-    assert runtime._jq_plan["phase"] == "COMPLETED"
-
-
-def test_null_order_is_not_completion_and_future_bar_can_retry(helper):
-    jq = JQ()
-    runtime = jq.runtime(helper)
-    original = helper._active_namespace["order_target_value"]
-    helper._active_namespace["order_target_value"] = lambda *args, **kwargs: None
-    start(jq, runtime, {"BUY": 0.8})
-    assert runtime._jq_plan["phase"] == "BUY"
-    assert jq.calls == []
-    helper._active_namespace["order_target_value"] = original
-    jq.context.current_dt += timedelta(minutes=1)
-    runtime.on_bar(jq.context)
-    assert jq.positions["BUY"].total_amount == 800
-    assert runtime._jq_plan["phase"] == "COMPLETED"
+    assert not hasattr(jq.g, "bt_jq_plan")

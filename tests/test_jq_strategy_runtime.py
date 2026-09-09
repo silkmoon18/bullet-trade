@@ -81,7 +81,7 @@ def _state(mode, run_type, **extra):
     jq_enabled = mode in ("BACKTEST", "JQ", "JQ_QMT_PARALLEL")
     qmt_enabled = mode in ("QMT_REMOTE", "JQ_QMT_PARALLEL")
     state = {
-        "api_version": 19,
+        "api_version": 20,
         "profile_schema_version": 3,
         "profile": None if mode == "BACKTEST" else PROFILE,
         "mode": mode,
@@ -127,9 +127,9 @@ def test_public_contract_exports_and_constants(helper):
         "submit_runtime_targets",
         "cancel_runtime_targets",
     }.issubset(set(helper.__all__))
-    assert helper.STRATEGY_RUNTIME_API_VERSION == 19
+    assert helper.STRATEGY_RUNTIME_API_VERSION == 20
     assert helper.STRATEGY_RUNTIME_HELPER_MARKER == (
-        "bullet-trade-joinquant-runtime-helper-v19"
+        "bullet-trade-joinquant-runtime-helper-v20"
     )
     assert helper.PROFILE_SCHEMA_VERSION == 3
 
@@ -771,7 +771,7 @@ def test_namespace_must_be_plain_dict(helper):
 
 
 @pytest.mark.parametrize(
-    "version", [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, "15", True, None]
+    "version", [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, "15", 18, 19, True, None]
 )
 def test_expected_api_version_must_equal_current(helper, version):
     with pytest.raises(RuntimeError, match="API版本不匹配"):

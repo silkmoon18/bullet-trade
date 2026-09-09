@@ -1,11 +1,14 @@
 from datetime import datetime
 
+import pytest
+
 from bullet_trade.server.feishu_notifier import (
     FeishuNotifier,
     FeishuTradeNotifier,
     TargetBuyPlanItem,
     TargetBuyPlanNotification,
     TradeNotification,
+    reconciliation_notification,
 )
 from bullet_trade.server.strategy.domain import SHANGHAI_TZ
 
@@ -158,3 +161,69 @@ def test_legacy_notifier_accepts_structured_trade_notification(monkeypatch):
     notifier.flush()
 
     assert sent == [trade]
+
+
+def test_reconciliation_card_explains_each_position_shortage_and_uses_names():
+    blockers = (
+        "broker_position_insufficient:159086.XSHE:strategy=(1200,1200):broker=(1200,0)",
+        "broker_position_insufficient:588370.XSHG:strategy=(600,600):broker=(500,0)",
+    )
+    notice = reconciliation_notification(
+        "good_etf_remote", blockers,
+        {"159086.XSHE": "金融科技ETF广发", "588370.XSHG": "科创50增强ETF南方"},
+        datetime(2026, 9, 9, 9, 30, tzinfo=SHANGHAI_TZ),
+    )
+    payload = FeishuTradeNotifier("https://example.invalid/hook").build_payload(notice)
+    title = payload["card"]["header"]["title"]["content"]
+    content = payload["card"]["elements"][0]["text"]["content"]
+    assert payload["card"]["header"]["template"] == "red"
+    assert "金融科技ETF广发（159086.XSHE）" in title
+    assert "科创50增强ETF南方（588370.XSHG）" in title
+    assert title.endswith("good_etf_remote")
+    assert "**问题 1：**" in content and "**问题 2：**" in content
+    assert "**原因：** QMT可卖数量不足" in content
+    assert "**原因：** QMT持仓总量不足" in content
+    assert "**账本归属持仓：** 1200 股" in content
+    assert "**账本要求可卖（扣除策略卖单冻结）：** 1200 股" in content
+    assert "**QMT持仓总量：** 1200 股" in content
+    assert "**QMT当前可卖：** 0 股" in content
+    assert "**对账时间：** 2026-09-09 09:30:00" in content
+    assert "JQ账户独立运行" in content
+    assert "不会因此撤销已有柜台委托" in content
+    assert "**处理提示：**" in content
+    assert all(raw in content for raw in blockers)
+    assert "**单价：**" not in content and "**方向：**" not in content
+    assert "已完成结算" not in content
+
+
+def test_reconciliation_cash_units_are_displayed_in_yuan():
+    notice = reconciliation_notification("s", (
+        "broker_cash_insufficient:strategy_required=100000000:broker=90000000",
+    ), {})
+    assert "**账本要求可用资金：** ¥10000.00" in notice.detail
+    assert "**QMT可用资金：** ¥9000.00" in notice.detail
+
+
+@pytest.mark.parametrize("raw,reason", [
+    ("trade_error:t1:broker fill id was reused with different fields", "成交回报校验或入账失败"),
+    ("owned_trade_order_missing:0", "策略成交未找到对应委托"),
+    ("missing_working_order:o1", "本地活动委托在柜台查询中缺失"),
+    ("capability:stable_trade_id is unsupported", "券商接口能力验证未通过"),
+    ("broker_position_insufficient:malformed", "其他对账异常"),
+    ("new_unknown_blocker:details", "其他对账异常"),
+])
+def test_reconciliation_card_keeps_raw_error_with_readable_fallback(raw, reason):
+    notice = reconciliation_notification("s", (raw,), {})
+    assert "**原因：** " + reason in notice.detail
+    assert "**原始错误：** `" + raw + "`" in notice.detail
+    assert "**描述：**" in notice.detail
+
+
+def test_reconciliation_missing_names_and_empty_reasons_still_build_cards():
+    notice = reconciliation_notification("s", (
+        "broker_position_insufficient:159086.XSHE:strategy=(100,100):broker=(100,0)",
+    ), {})
+    assert notice.title.endswith("159086.XSHE")
+    empty = reconciliation_notification("s", (), {})
+    payload = FeishuTradeNotifier("https://example.invalid/hook").build_payload(empty)
+    assert "未提供具体阻断原因" in str(payload)

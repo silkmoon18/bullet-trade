@@ -100,6 +100,7 @@ class BrokerPositionSnapshot:
     security: str
     total_qty: int
     sellable_qty: int
+    security_name: str = ""
 
     def __post_init__(self) -> None:
         if not self.security:
@@ -250,7 +251,10 @@ def _build_broker_snapshot(
         seen.add(security)
         try:
             normalized_positions.append(
-                BrokerPositionSnapshot(security, total, sellable)
+                BrokerPositionSnapshot(
+                    security, total, sellable,
+                    str(row.get("name") or row.get("security_name") or ""),
+                )
             )
         except ValueError as exc:
             raise BrokerContractError(str(exc)) from exc

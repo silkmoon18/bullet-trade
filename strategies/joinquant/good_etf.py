@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 STRATEGY_ID = 'good_etf_remote'
 
 VALIDATE_REMOTE_DURING_BACKTEST = True
-_EXPECTED_RUNTIME_API_VERSION = 19
+_EXPECTED_RUNTIME_API_VERSION = 20
 _EXPECTED_RUNTIME_PROFILE_MODULE = 'jq_runtime_config'
 
 # ===== 策略参数 =====
@@ -50,7 +50,7 @@ RISK_CHECK_TIMES = ('10:30', '13:30', '14:50')  # 每日止盈止损检查时间
 _runtime: Any = None
 
 
-def _install_runtime(context: 'Context') -> Dict[str, object]:
+def _install_runtime(context: 'Context') -> None:
     """安装统一运行门面；模式、校验和远程预检均由helper负责。"""
     global _runtime
     _runtime = bt.install_joinquant_runtime(
@@ -62,7 +62,6 @@ def _install_runtime(context: 'Context') -> Dict[str, object]:
         profile_module=_EXPECTED_RUNTIME_PROFILE_MODULE,
         validate_remote_during_backtest=VALIDATE_REMOTE_DURING_BACKTEST,
     )
-    return dict(_runtime.state)
 
 
 def _load_tracked_index_names(codes: List[str], as_of: Any) -> Dict[str, str]:
@@ -290,16 +289,9 @@ def market_open(context: 'Context') -> None:
             message = '无折价ETF可选，已提交全部卖出目标，今日不再买入'
             log.warn(message)
             _runtime.log_strategy_event(message)
-        else:
-            log.info('===== 开盘选股下单完成 =====')
 
     except Exception as e:
         log.error(f"开盘执行异常：{e}")
-
-
-def handle_data(context: 'Context', data: Any) -> None:
-    """聚宽分钟入口；订单续行全部委托运行时。"""
-    _runtime.on_bar(context)
 
 
 def handle_risk_management(context: 'Context') -> None:

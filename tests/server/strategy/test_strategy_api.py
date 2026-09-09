@@ -506,6 +506,9 @@ async def test_submit_reports_fresh_blocker_before_valuation_or_order_side_effec
     assert "broker_cash_insufficient" in str(caught.value)
     assert reads and broker.order_calls == 0 and broker.cancel_calls == []
     assert notifications[-1].event == "RECONCILIATION_BLOCKED"
+    assert "**原因：** QMT可用资金不足" in notifications[-1].detail
+    assert "**QMT可用资金：** ¥0.00" in notifications[-1].detail
+    assert notifications[-1].occurred_at is not None
     assert service.get_intent({"strategy_id": "good_etf"}) == {}
 
 

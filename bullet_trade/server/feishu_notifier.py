@@ -6,13 +6,14 @@ import base64
 import hashlib
 import hmac
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from queue import Queue
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Union
 
 import requests  # type: ignore[import-untyped]
 
@@ -93,6 +94,95 @@ def _security_title(security: str, security_name: str) -> str:
     return code
 
 
+def reconciliation_notification(
+    strategy_id: str,
+    blockers: Sequence[str],
+    security_names: Mapping[str, str],
+    occurred_at: Optional[datetime] = None,
+) -> TradeNotification:
+    """Describe reconciliation evidence without changing its trading decision."""
+    lines = [
+        "**影响：** 当前QMT策略未通过对账，新目标提交及后续发单被拦截；"
+        "不会因此撤销已有柜台委托。JQ账户独立运行。",
+    ]
+    securities = []
+    for index, raw in enumerate(blockers or ("未提供具体阻断原因",), 1):
+        raw = str(raw)
+        codes = re.findall(r"\b\d{6}\.(?:XSHG|XSHE|XBSE|BJ)\b", raw)
+        securities.extend(code for code in codes if code not in securities)
+        lines.append("\n**问题 {}：**".format(index))
+        for code in dict.fromkeys(codes):
+            lines.append("**标的：** {}".format(
+                _security_title(code, security_names.get(code, ""))
+            ))
+        position = re.fullmatch(
+            r"broker_position_insufficient:[^:]+:strategy=\((\d+),(\d+)\):"
+            r"broker=\((\d+),(\d+)\)", raw,
+        )
+        cash = re.fullmatch(
+            r"broker_cash_insufficient:strategy_required=(\d+):broker=(\d+)", raw,
+        )
+        if position:
+            owned, required, total, sellable = map(int, position.groups())
+            total_shortage = total < owned
+            lines.extend([
+                "**原因：** {}".format(
+                    "QMT持仓总量不足" if total_shortage else "QMT可卖数量不足"
+                ),
+                "**账本归属持仓：** {} 股".format(owned),
+                "**账本要求可卖（扣除策略卖单冻结）：** {} 股".format(required),
+                "**QMT持仓总量：** {} 股".format(total),
+                "**QMT当前可卖：** {} 股".format(sellable),
+                "**描述：** {}".format(
+                    "QMT持仓不足以覆盖账本归属数量，需核对成交和人工操作。"
+                    if total_shortage else
+                    "持仓总量足够，但柜台可卖不足；不能据此认定股票已丢失。"
+                ),
+                "**处理提示：** 核对柜台持仓、冻结委托及结算状态；"
+                "差异原因须另行确认，不会自动改写持仓或可卖数量。",
+            ])
+        elif cash:
+            required, available = map(int, cash.groups())
+            lines.extend([
+                "**原因：** QMT可用资金不足",
+                "**账本要求可用资金：** ¥{}".format(
+                    _display(Decimal(required) / MONEY_SCALE)
+                ),
+                "**QMT可用资金：** ¥{}".format(
+                    _display(Decimal(available) / MONEY_SCALE)
+                ),
+                "**描述：** 差额超过当前对账允许的费用容差。",
+                "**处理提示：** 核对资金冻结、出入金、成交及费用记录。",
+            ])
+        else:
+            reason = {
+                "capability": "券商接口能力验证未通过",
+                "trade_error": "成交回报校验或入账失败",
+                "order_error": "委托状态同步失败",
+                "order_match_error": "柜台委托与本地订单关联失败",
+                "owned_broker_order_missing_id": "策略委托缺少有效柜台订单号",
+                "owned_order_broker_id_mismatch": "策略委托的柜台订单号不匹配",
+                "owned_trade_order_missing": "策略成交未找到对应委托",
+                "missing_working_order": "本地活动委托在柜台查询中缺失",
+            }.get(raw.split(":", 1)[0], "其他对账异常")
+            lines.extend([
+                "**原因：** {}".format(reason),
+                "**描述：** 当前回报或校验结果未满足账本一致性要求。",
+                "**处理提示：** 根据原始错误核对对应委托、成交或能力验证记录。",
+            ])
+        lines.append("**原始错误：** `{}`".format(raw))
+    title = "实盘账实对账已阻断"
+    if securities:
+        title += " · " + "、".join(
+            _security_title(code, security_names.get(code, "")) for code in securities
+        )
+    return TradeNotification(
+        event="RECONCILIATION_BLOCKED", strategy_id=strategy_id,
+        security="-", side="-", status="BLOCKED", title=title,
+        detail="\n".join(lines), occurred_at=occurred_at,
+    )
+
+
 class FeishuTradeNotifier:
     def __init__(
         self,
@@ -162,7 +252,14 @@ class FeishuTradeNotifier:
             lines.append("**订单号：** `{}`".format(notification.order_id))
         if notification.trade_id:
             lines.append("**成交号：** `{}`".format(notification.trade_id))
-        if notification.detail:
+        if notification.event.upper() == "RECONCILIATION_BLOCKED":
+            lines = [
+                "**策略ID：** `{}`".format(notification.strategy_id or "-"),
+                "**状态：** 对账阻断（BLOCKED）",
+                "**对账时间：** {}".format(occurred_at.strftime("%Y-%m-%d %H:%M:%S")),
+                notification.detail or "**原因：** 未提供具体阻断原因",
+            ]
+        elif notification.detail:
             lines.append("**说明：** {}".format(notification.detail))
         payload: Dict[str, Any] = {
             "msg_type": "interactive",

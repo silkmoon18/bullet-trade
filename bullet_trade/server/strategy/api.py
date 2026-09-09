@@ -18,7 +18,7 @@ from .broker_contract import BrokerCapabilityProfile
 from ..feishu_notifier import (
     TargetBuyPlanItem,
     TargetBuyPlanNotification,
-    TradeNotification,
+    reconciliation_notification,
 )
 from .capital import BrokerCashMismatchError, SQLiteCapitalService
 from .domain import (
@@ -735,14 +735,10 @@ class SQLiteStrategyAPI:
                 if not isinstance(blockers, (list, tuple)):
                     blockers = (blockers,)
                 self.notification_handler(
-                    TradeNotification(
-                        event="RECONCILIATION_BLOCKED",
-                        strategy_id=strategy_id,
-                        security="-",
-                        side="-",
-                        status="BLOCKED",
-                        detail="; ".join(str(item) for item in blockers),
-                        title="实盘账实对账已阻断",
+                    reconciliation_notification(
+                        strategy_id, tuple(str(item) for item in blockers),
+                        {p.security: p.security_name for p in broker_snapshot.positions},
+                        occurred_at=broker_snapshot.as_of,
                     )
                 )
             except Exception:
