@@ -15,6 +15,7 @@ from bullet_trade.server.strategy import (
     ExecutionRequest,
     LedgerInvariantError,
     MarketMark,
+    MarketExecution,
     MarketQuote,
     SQLiteStrategyAPI,
     StrategyAPIConfig,
@@ -65,12 +66,13 @@ async def test_after_hours_target_is_not_created_or_dispatched(api, monkeypatch)
 
 @pytest.mark.asyncio
 async def test_dispatch_checks_time_before_each_order(api, monkeypatch):
-    service, _, _, _ = api
+    service, _, account, _ = api
+    await service.ensure_account(account, "default", {"strategy_id": "good_etf"})
     session_open = [True]
     monkeypatch.setattr(service, "_can_dispatch_now", lambda: session_open[0])
     calls = []
 
-    async def dispatch(submitter, strategy_id):
+    async def dispatch(submitter, strategy_id, *, sellable_limits):
         calls.append(strategy_id)
         session_open[0] = False
         return "first-dispatch"
@@ -1258,6 +1260,127 @@ async def test_initial_cash_shortage_fails_without_strategy_account(api):
 
 def test_money_scale_is_still_exact():
     assert money_to_units("10000") == 100_000_000
+
+
+async def _seed_sellable_position(api, monkeypatch, available):
+    service, broker, account, notifications = api
+    service.data_provider = CallbackData()
+
+    async def get_tplus(security):
+        return 0
+
+    monkeypatch.setattr(service.data_provider, "get_tplus", get_tplus, raising=False)
+    await service.ensure_account(account, "default", {"strategy_id": "good_etf"})
+    seed = await service.submit_targets(account, "default", {
+        "strategy_id": "good_etf", "idempotency_key": "seed-position",
+        "weights": {SECURITY: 0.5}, "marks": {SECURITY: 10},
+    })
+    broker.orders[0]["status"] = "filled"
+    broker.trades = [{
+        "trade_id": "seed-fill", "trade_id_source": "broker",
+        "order_id": broker.orders[0]["order_id"], "security": SECURITY,
+        "side": "BUY", "amount": 500, "price": 10.02,
+        "commission_fee": 5, "commission_known": True,
+        "tax": 0, "tax_known": True, "time": datetime.now(SHANGHAI_TZ).isoformat(),
+    }]
+    broker.positions = [{"security": SECURITY, "name": "测试ETF", "amount": 500,
+                         "closeable_amount": available}]
+    snapshot = await service.get_snapshot(account, "default", {"strategy_id": "good_etf"})
+    assert snapshot["reconciliation"]["state"] == "READY"
+    assert snapshot["positions"][SECURITY]["closeable_amount"] == min(500, available)
+    await service._resume_intent_locked(seed["intent"]["intent_id"])
+    assert service.planner.get_intent(seed["intent"]["intent_id"]).state is IntentState.COMPLETED
+    calls = []
+    original_place = broker.place_order
+
+    async def place_order(account, payload):
+        calls.append(dict(payload))
+        if payload["side"] == "BUY":
+            return await original_place(account, payload)
+        broker.order_calls += 1
+        order_id = "broker-{}".format(broker.order_calls)
+        broker.orders.append({"order_id": order_id, "security": payload["security"],
+                              "status": "open", "side": "SELL",
+                              "order_remark": payload["order_remark"]})
+        broker.positions[0]["closeable_amount"] -= int(payload["amount"])
+        return {"order_id": order_id}
+
+    monkeypatch.setattr(broker, "place_order", place_order)
+    notifications.clear()
+    return calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("available,expected", [(0, 0), (200, 200), (500, 500), (900, 500)])
+async def test_sellable_capacity_caps_sell_and_preserves_sell_before_buy(api, monkeypatch, available, expected):
+    service, broker, account, notifications = api
+    calls = await _seed_sellable_position(api, monkeypatch, available)
+    result = await service.submit_targets(account, "default", {
+        "strategy_id": "good_etf", "idempotency_key": "rotate",
+        "weights": {"510300.XSHG": 0.5}, "marks": {"510300.XSHG": 10},
+        "execution": execution_request_to_wire(ExecutionRequest(sell_style=MarketExecution())),
+    })
+    assert result["reconciliation"]["state"] == "READY"
+    assert result["intent"]["state"] == "EXECUTING"
+    assert [(p["side"], p["amount"]) for p in calls] == ([] if not expected else [("SELL", expected)])
+    assert not any(getattr(n, "event", "") == "RECONCILIATION_BLOCKED" for n in notifications)
+    if not expected:
+        assert SECURITY in service.data_provider.subscriptions[-1]
+
+
+@pytest.mark.asyncio
+async def test_sellable_recovery_tick_resumes_market_sell_once(api, monkeypatch):
+    service, broker, account, _ = api
+    calls = await _seed_sellable_position(api, monkeypatch, 0)
+    result = await service.submit_targets(account, "default", {
+        "strategy_id": "good_etf", "idempotency_key": "wait-sell",
+        "weights": {SECURITY: 0},
+        "execution": execution_request_to_wire(ExecutionRequest(style=MarketExecution())),
+    })
+    assert result["planned_orders"] == []
+    broker.positions[0]["closeable_amount"] = 500
+    tick = MarketQuote(SECURITY, datetime.now(SHANGHAI_TZ), last_price_units=price_to_units("10"))
+    await service._handle_quote(SECURITY, tick)
+    await service._handle_quote(SECURITY, tick)
+    assert [(p["side"], p["amount"]) for p in calls] == [("SELL", 500)]
+    assert service.planner.get_intent(result["intent"]["intent_id"]).state is IntentState.EXECUTING
+
+
+@pytest.mark.asyncio
+async def test_pending_sell_waits_if_capacity_drops_before_dispatch(api, monkeypatch):
+    service, broker, account, _ = api
+    calls = await _seed_sellable_position(api, monkeypatch, 500)
+    snapshot, _, marks = await service._refresh(account, "default", "good_etf", {})
+    advance = service.planner.submit_target_weights(
+        "good_etf", "queued-sell", {SECURITY: 0}, snapshot, marks, snapshot.as_of,
+    )
+    assert len(advance.orders) == 1
+    broker.positions[0]["closeable_amount"] = 0
+    await service._resume_intent_locked(advance.intent.intent_id)
+    assert calls == []
+    db = connect_database(service.database_path)
+    try:
+        assert db.execute("SELECT state FROM strategy_orders WHERE side='SELL'").fetchone()[0] == "PENDING_SUBMIT"
+        assert db.execute("SELECT attempt_count FROM outbox WHERE state='PENDING'").fetchone()[0] == 0
+    finally:
+        db.close()
+    broker.positions[0]["closeable_amount"] = 500
+    await service._handle_quote(SECURITY, MarketQuote(SECURITY, datetime.now(SHANGHAI_TZ)))
+    assert [(p["side"], p["amount"]) for p in calls] == [("SELL", 500)]
+
+
+@pytest.mark.asyncio
+async def test_real_total_position_shortage_still_blocks_before_dispatch(api, monkeypatch):
+    service, broker, account, notifications = api
+    calls = await _seed_sellable_position(api, monkeypatch, 0)
+    broker.positions[0]["amount"] = 400
+    with pytest.raises(RuntimeError, match="broker_position_insufficient"):
+        await service.submit_targets(account, "default", {
+            "strategy_id": "good_etf", "idempotency_key": "missing-total",
+            "weights": {SECURITY: 0},
+        })
+    assert calls == []
+    assert notifications[-1].event == "RECONCILIATION_BLOCKED"
 
 
 @pytest.mark.asyncio

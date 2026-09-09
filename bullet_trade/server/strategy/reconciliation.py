@@ -6,7 +6,7 @@ import hashlib
 import json
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, time, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Protocol, Tuple, Union, cast
 from uuid import uuid4
@@ -37,16 +37,6 @@ from .schema import connect_database
 
 
 DatabasePath = Union[str, Path]
-
-
-_BROKER_SETTLEMENT_REFRESH_TIME = time(9, 15)
-
-
-def _enforce_broker_sellable_capacity(as_of: datetime) -> bool:
-    """Treat QMT sellable quantity as authoritative after morning settlement."""
-
-    local = as_shanghai_time(as_of)
-    return local.weekday() < 5 and local.time() >= _BROKER_SETTLEMENT_REFRESH_TIME
 
 
 class BrokerSnapshotReader(Protocol):
@@ -575,7 +565,7 @@ class SQLiteReconciliationService:
             for item in snapshot.positions
         }
         deferred_sellable_shortages = []
-        enforce_sellable = _enforce_broker_sellable_capacity(snapshot.as_of)
+        sellable_limits = {}
         for security, (owned_total, owned_sellable) in sorted(owned_positions.items()):
             broker_total, broker_sellable = broker_positions.get(security, (0, 0))
             required_sellable = max(
@@ -593,10 +583,8 @@ class SQLiteReconciliationService:
             if broker_total < owned_total:
                 blockers.append(shortage)
             elif broker_sellable < required_sellable:
-                if enforce_sellable:
-                    blockers.append(shortage)
-                else:
-                    deferred_sellable_shortages.append(shortage)
+                deferred_sellable_shortages.append(shortage)
+                sellable_limits[security] = broker_sellable
 
         details = {
             "blockers": sorted(set(blockers)),
@@ -617,6 +605,7 @@ class SQLiteReconciliationService:
             "deferred_broker_sellable_shortages": sorted(
                 set(deferred_sellable_shortages)
             ),
+            "broker_sellable_limits": sellable_limits,
             "capability_verification_required": self.require_verified_capabilities,
             "durable_broker_history": self.durable_broker_history,
         }

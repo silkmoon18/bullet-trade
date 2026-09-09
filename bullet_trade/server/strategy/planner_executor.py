@@ -448,8 +448,10 @@ class SQLiteTargetExecutionService:
         self,
         submitter: Callable[[Mapping[str, object]], Awaitable[Mapping[str, object]]],
         strategy_account_id: Optional[str] = None,
+        *,
+        sellable_limits: Optional[Mapping[str, int]] = None,
     ) -> Optional[DispatchResult]:
-        claim = self._operations.claim_next(strategy_account_id)
+        claim = self._operations.claim_next(strategy_account_id, sellable_limits=sellable_limits)
         if claim is None:
             return None
         envelope = json.loads(claim.payload_json)

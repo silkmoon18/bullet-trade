@@ -68,6 +68,28 @@ def test_same_key_and_payload_replays_one_operation_and_outbox(operation_reposit
     assert _counts(operation_repository) == (1, 1)
 
 
+def test_sellable_filter_keeps_blocked_order_pending_and_claims_other_security(operation_repository):
+    repository = operation_repository
+    first = repository.create_operation("good-etf", "broker.submit", "sell-a", {
+        "side": "SELL", "security": "510050.XSHG", "amount": 500,
+    })
+    second = repository.create_operation("good-etf", "broker.submit", "sell-b", {
+        "side": "SELL", "security": "510300.XSHG", "amount": 200,
+    })
+    claim = repository.claim_next("good-etf", sellable_limits={"510300.XSHG": 200})
+    assert claim.operation_id == second.operation.operation_id
+    assert repository.claim_next("good-etf", sellable_limits={"510050.XSHG": 499}) is None
+    db = connect_database(repository.database_path)
+    try:
+        row = db.execute("SELECT state, attempt_count FROM outbox WHERE operation_id=?",
+                         (first.operation.operation_id,)).fetchone()
+        assert tuple(row) == ("PENDING", 0)
+    finally:
+        db.close()
+    recovered = repository.claim_next("good-etf", sellable_limits={"510050.XSHG": 500})
+    assert recovered.operation_id == first.operation.operation_id
+
+
 def test_same_key_with_different_payload_conflicts(operation_repository):
     _create(operation_repository, amount=100)
     with pytest.raises(IdempotencyConflictError, match="different payload"):

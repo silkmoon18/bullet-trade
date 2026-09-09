@@ -30,6 +30,7 @@
 24. [固定价格、价格笼子与T+0修改记录](23-fixed-limit-review.md)
 25. [API19 JQ分阶段调仓历史记录（已撤回）](28-jq-rebalance-continuation.md)
 26. [API20恢复JQ原生执行](29-restore-jq-native-execution.md)
+27. [QMT可卖不足的逐标的等待与部署](30-sellable-capacity.md)
 
 `archive/`：历史审查记录归档（S01逐轮REWORK与S01至S03逐轮冻结明细）；其中各轮候选结论均已失效，仅作历史记录，不作为放行证据。
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass, fields, is_dataclass, replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from enum import Enum
@@ -149,6 +149,7 @@ class SQLiteStrategyAPI:
         self._seen_tick_symbols = set()
         self._rejected_tick_symbols = set()
         self._resume_locks = {}
+        self._sellable_waits = {}
         self._dispatch_lock = asyncio.Lock()
         self._background_tasks = set()
         self.repository = SQLiteStrategyRepository(self.database_path)
@@ -713,6 +714,14 @@ class SQLiteStrategyAPI:
             as_of,
             self._valuation_mark_max_age(as_of),
         )
+        broker_sellable = {
+            p.security: max(0, p.sellable_qty) for p in broker_snapshot.positions
+        }
+        snapshot = replace(snapshot, positions=tuple(
+            replace(p, sellable_qty=min(
+                p.sellable_qty, broker_sellable.get(p.security, 0)
+            )) for p in snapshot.positions
+        ))
         return snapshot, reconciliation, marks
 
     async def _synchronize(self, strategy_id, physical_id, broker_snapshot):
@@ -725,6 +734,19 @@ class SQLiteStrategyAPI:
             settlement_cycles=settlement_cycles,
         )
         self.startup_ready = result.state.value == "READY"
+        limits = dict(result.details.get("broker_sellable_limits", {}))
+        old_limits = self._sellable_waits.get(strategy_id, {})
+        self._sellable_waits[strategy_id] = limits
+        if limits != old_limits:
+            names = {p.security: p.security_name for p in broker_snapshot.positions}
+            for security in sorted(set(limits) | set(old_limits)):
+                if limits.get(security) != old_limits.get(security):
+                    logger.info(
+                        "QMT可卖限制 | strategy_id=%s | %s(%s) | %s",
+                        strategy_id, security, names.get(security) or "名称未知",
+                        "QMT当前可卖={}；不足部分等待，不阻断整账户".format(limits[security])
+                        if security in limits else "可卖限制已解除",
+                    )
         if (
             self.notification_handler is not None
             and result.state.value == "BLOCKED"
@@ -1005,14 +1027,15 @@ class SQLiteStrategyAPI:
         if quote is None:
             return
         for intent in self.planner.active_intents():
+            waiting_sellable = security in self._sellable_waits.get(intent.account_id, {})
             if (
-                not _uses_quote_execution(intent.execution_request, security)
+                (not waiting_sellable and not _uses_quote_execution(intent.execution_request, security))
                 or security not in self.planner.reference_prices(intent.intent_id)
                 or intent.account_id not in self._runtime_bindings
                 or not self._strategy_reconciliation_enabled(intent.account_id)
             ):
                 continue
-            if not self.planner.quote_triggers_intent(
+            if not waiting_sellable and not self.planner.quote_triggers_intent(
                 intent.intent_id, security, quote
             ):
                 continue
@@ -1162,8 +1185,22 @@ class SQLiteStrategyAPI:
         dispatched = []
         async with self._dispatch_lock:
             while self._can_dispatch_now():
+                binding = self._runtime_bindings.get(strategy_account_id)
+                if binding is None:
+                    break
+                broker_snapshot = await collect_async_broker_snapshot(
+                    cast(Any, self.broker), binding[0]
+                )
+                reconciliation = await self._synchronize(
+                    strategy_account_id, self._physical_id(binding[1]), broker_snapshot
+                )
+                if reconciliation.state.value != "READY" or not self._can_dispatch_now():
+                    break
                 dispatch = await self.planner.dispatch_next(
-                    submitter, strategy_account_id
+                    submitter, strategy_account_id,
+                    sellable_limits={
+                        p.security: max(0, p.sellable_qty) for p in broker_snapshot.positions
+                    },
                 )
                 if dispatch is None:
                     break
@@ -1178,6 +1215,11 @@ class SQLiteStrategyAPI:
     async def _sync_quote_subscriptions(self, strategy_id: str) -> None:
         symbols = set()
         for intent in self.planner.active_intents(strategy_id):
+            if not self.planner.intent_cancel_requested(intent.intent_id):
+                symbols.update(
+                    set(self._sellable_waits.get(strategy_id, {}))
+                    & set(self.planner.reference_prices(intent.intent_id))
+                )
             if _uses_quote_execution(
                 intent.execution_request
             ) and not self.planner.intent_cancel_requested(intent.intent_id):

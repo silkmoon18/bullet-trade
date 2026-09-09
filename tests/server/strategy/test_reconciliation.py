@@ -628,7 +628,7 @@ def test_owned_working_sell_freeze_reduces_required_broker_sellable(tmp_path):
     assert result.details["strategy_frozen_sell_qty"] == {SECURITY: 1000}
 
 
-def test_overnight_qmt_sellable_lag_is_deferred_until_morning(tmp_path):
+def test_qmt_sellable_lag_limits_execution_instead_of_blocking_account(tmp_path):
     database, _, capital, reconciliation = _services(tmp_path)
     booking = SQLiteFillBookingService(database)
     booking.register_order(_order())
@@ -665,11 +665,17 @@ def test_overnight_qmt_sellable_lag_is_deferred_until_morning(tmp_path):
         ACCOUNT_ID, PHYSICAL_ID, morning
     )
 
-    assert morning_result.state is ReconciliationState.BLOCKED
-    assert any(
-        item.startswith("broker_position_insufficient:")
-        for item in morning_result.details["blockers"]
+    assert morning_result.state is ReconciliationState.READY
+    assert morning_result.details["blockers"] == ()
+    assert dict(morning_result.details["broker_sellable_limits"]) == {SECURITY: 0}
+    assert overnight_result.details["broker_sellable_limits"] == morning_result.details["broker_sellable_limits"]
+
+    recovered = reconciliation.synchronize(
+        ACCOUNT_ID, PHYSICAL_ID,
+        replace(morning, positions=(BrokerPositionSnapshot(SECURITY, 1000, 1000),)),
     )
+    assert recovered.state is ReconciliationState.READY
+    assert dict(recovered.details["broker_sellable_limits"]) == {}
 
 
 def test_unknown_fee_fill_is_booked_and_small_cash_gap_is_tolerated(tmp_path):

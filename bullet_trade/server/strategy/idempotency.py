@@ -259,7 +259,8 @@ class SQLiteOperationRepository:
             connection.close()
 
     def claim_next(
-        self, strategy_account_id: Optional[str] = None
+        self, strategy_account_id: Optional[str] = None,
+        *, sellable_limits: Optional[Mapping[str, int]] = None,
     ) -> Optional[OutboxClaim]:
         """Atomically claim the oldest dispatchable outbox row.
 
@@ -271,9 +272,9 @@ class SQLiteOperationRepository:
         try:
             connection.execute("BEGIN IMMEDIATE")
             now_text = _now_text()
-            row = connection.execute(
+            candidates = connection.execute(
                 """
-                SELECT o.outbox_id
+                SELECT o.outbox_id, o.payload_json
                 FROM outbox AS o
                 JOIN strategy_operations AS op ON op.operation_id = o.operation_id
                 WHERE op.state = 'PENDING'
@@ -281,10 +282,20 @@ class SQLiteOperationRepository:
                   AND o.available_at <= ?
                   AND (? IS NULL OR o.strategy_account_id = ?)
                 ORDER BY o.outbox_id
-                LIMIT 1
                 """,
                 (now_text, strategy_account_id, strategy_account_id),
-            ).fetchone()
+            ).fetchall()
+            row = None
+            for candidate in candidates:
+                if sellable_limits is not None:
+                    payload = json.loads(candidate["payload_json"]).get("payload", {})
+                    if (
+                        payload.get("side") == "SELL"
+                        and int(payload["amount"]) > sellable_limits.get(payload["security"], 0)
+                    ):
+                        continue
+                row = candidate
+                break
             if row is None:
                 connection.commit()
                 return None
