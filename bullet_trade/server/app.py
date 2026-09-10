@@ -216,6 +216,8 @@ class ServerApplication:
         if self._server:
             self._server.close()
             await self._server.wait_closed()
+        if self.strategy_api:
+            await self.strategy_api.close()
         if self.adapters.broker_adapter:
             try:
                 await self.adapters.broker_adapter.stop()

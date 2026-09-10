@@ -19,6 +19,10 @@ class _RecoveringStrategyAPI:
     def __init__(self):
         self.calls = 0
         self.recovered = asyncio.Event()
+        self.closed = False
+
+    async def close(self):
+        self.closed = True
 
     async def startup_check(self, _account_context, _account_key):
         self.calls += 1
@@ -31,6 +35,10 @@ class _RecoveringStrategyAPI:
 class _ExpiryStrategyAPI:
     def __init__(self):
         self.called = asyncio.Event()
+        self.closed = False
+
+    async def close(self):
+        self.closed = True
 
     async def startup_check(self, _account_context, _account_key):
         return True
@@ -81,6 +89,7 @@ async def test_strategy_startup_retries_after_qmt_becomes_ready(monkeypatch):
 
     await app.shutdown()
     assert app._strategy_startup_task is None
+    assert strategy_api.closed
 
 
 @pytest.mark.asyncio
@@ -110,3 +119,4 @@ async def test_strategy_midnight_expiry_task_starts_and_stops():
 
     await app.shutdown()
     assert app._strategy_expiry_task is None
+    assert strategy_api.closed

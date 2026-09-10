@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import replace
 from datetime import datetime, timedelta
 
 import pytest
@@ -32,6 +33,112 @@ from bullet_trade.server.strategy.domain import IntentState, SHANGHAI_TZ
 SECURITY = "510050.XSHG"
 
 
+async def drain_execution(service):
+    while service._background_tasks:
+        await asyncio.gather(*tuple(service._background_tasks))
+
+
+async def submit_and_drain(service, account, key, payload):
+    # Execution tests explicitly wait for the server worker; RPC acceptance
+    # itself no longer promises a submitted/filled order.
+    accepted = await service.submit_targets(account, key, payload)
+    await drain_execution(service)
+    return accepted
+
+
+@pytest.mark.asyncio
+async def test_target_ack_does_not_wait_for_native_submit_or_share_client_cancellation(api, monkeypatch):
+    service, broker, account, _ = api
+    await service.ensure_account(account, "default", {"strategy_id": "good_etf"})
+    entered, release, acknowledged = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    original = broker.place_order
+    submitted_payloads = []
+
+    async def slow_submit(account, payload):
+        submitted_payloads.append(payload)
+        entered.set()
+        await release.wait()
+        return await original(account, payload)
+
+    monkeypatch.setattr(broker, "place_order", slow_submit)
+    request = {"strategy_id": "good_etf", "idempotency_key": "slow-native",
+               "weights": {SECURITY: 0.5}, "marks": {SECURITY: 10}}
+    responses = []
+
+    async def client():
+        responses.append(await service.submit_targets(account, "default", request))
+        acknowledged.set()
+        await asyncio.Event().wait()
+
+    client_task = asyncio.create_task(client())
+    await asyncio.wait_for(acknowledged.wait(), 1)
+    await asyncio.wait_for(entered.wait(), 1)
+    assert responses[0]["dispatched_orders"] == []
+    assert responses[0]["snapshot"]["reserved_cash"] > 0
+    repeated = await service.submit_targets(account, "default", request)
+    assert repeated["intent"]["intent_id"] == responses[0]["intent"]["intent_id"]
+    assert len(service._submission_tasks) == 1
+    client_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await client_task
+    assert not next(iter(service._submission_tasks.values())).cancelled()
+    release.set()
+    await drain_execution(service)
+    assert broker.order_calls == 1
+    assert submitted_payloads[0]["wait_timeout"] == 0
+    db = connect_database(service.database_path)
+    try:
+        assert tuple(db.execute("SELECT state, broker_order_id FROM strategy_orders").fetchone()) == ("SUBMITTED", "broker-1")
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_restart_recovers_accepted_but_not_yet_dispatched_target(api):
+    service, broker, account, _ = api
+    await service.ensure_account(account, "default", {"strategy_id": "good_etf"})
+    response = await service.submit_targets(account, "default", {
+        "strategy_id": "good_etf", "idempotency_key": "accepted-before-restart",
+        "weights": {SECURITY: 0.5}, "marks": {SECURITY: 10},
+    })
+    # Close before the worker has crossed the broker-effect boundary.
+    await service.close()
+    assert broker.order_calls == 0
+    restored = SQLiteStrategyAPI(service.config, broker, _capabilities(), FakeData())
+    assert await restored.startup_check(account, "default")
+    await drain_execution(restored)
+    assert broker.order_calls == 1
+    assert restored.get_intent({"strategy_id": "good_etf"})["intent_id"] == response["intent"]["intent_id"]
+    await restored.close()
+
+
+@pytest.mark.asyncio
+async def test_close_during_submit_quarantines_order_instead_of_requeue(api, monkeypatch):
+    service, broker, account, _ = api
+    await service.ensure_account(account, "default", {"strategy_id": "good_etf"})
+    entered = asyncio.Event()
+
+    async def never_returns(account, payload):
+        entered.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(broker, "place_order", never_returns)
+    await service.submit_targets(account, "default", {
+        "strategy_id": "good_etf", "idempotency_key": "shutdown-in-submit",
+        "weights": {SECURITY: 0.5}, "marks": {SECURITY: 10},
+    })
+    await asyncio.wait_for(entered.wait(), 1)
+    await service.close()
+    db = connect_database(service.database_path)
+    try:
+        assert db.execute("SELECT state FROM strategy_orders").fetchone()[0] == "SUBMIT_UNKNOWN"
+        assert db.execute("SELECT state FROM outbox").fetchone()[0] == "FAILED"
+    finally:
+        db.close()
+    with pytest.raises(RuntimeError, match="shutting down"):
+        await service.submit_targets(account, "default", {})
+
+
 @pytest.fixture(autouse=True)
 def execution_clock(monkeypatch):
     # Existing execution cases test trading-time behaviour, independently of
@@ -55,7 +162,7 @@ async def test_after_hours_target_is_not_created_or_dispatched(api, monkeypatch)
     service, broker, account, _ = api
     monkeypatch.setattr(service, "_can_dispatch_now", lambda: False)
     with pytest.raises(RuntimeError, match="非发单时段"):
-        await service.submit_targets(account, "default", {
+        await submit_and_drain(service, account, "default", {
             "strategy_id": "good_etf", "idempotency_key": "closed",
             "weights": {SECURITY: 0.5},
             "as_of": "2026-09-07T09:30:00+08:00",  # Cannot spoof wall time.
@@ -308,7 +415,7 @@ async def test_after_hours_callback_books_fill_without_planning_or_dispatch(api,
     await service.ensure_account(account, "default", {
         "strategy_id": "good_etf", "initial_capital": 10_000,
     })
-    await service.submit_targets(account, "default", {
+    await submit_and_drain(service, account, "default", {
         "strategy_id": "good_etf", "idempotency_key": "daytime",
         "weights": {SECURITY: "0.5"}, "marks": {SECURITY: "10"},
     })
@@ -471,7 +578,7 @@ async def test_submit_rechecks_current_account_instead_of_cached_startup_flag(ap
         account, "default", {"strategy_id": "good_etf", "initial_capital": 10_000}
     )
     service.startup_ready = False
-    result = await service.submit_targets(account, "default", {
+    result = await submit_and_drain(service, account, "default", {
         "strategy_id": "good_etf", "idempotency_key": "after-reconnect",
         "weights": {SECURITY: "0.5"}, "marks": {SECURITY: "10"},
     })
@@ -500,7 +607,7 @@ async def test_submit_reports_fresh_blocker_before_valuation_or_order_side_effec
         "blocked submit must report reconciliation before valuation"
     ))
     with pytest.raises(RuntimeError, match="StrategyLedger对账未就绪") as caught:
-        await service.submit_targets(account, "default", {
+        await submit_and_drain(service, account, "default", {
             "strategy_id": "good_etf", "idempotency_key": "still-blocked",
             "weights": {SECURITY: "0.5"}, "marks": {SECURITY: "10"},
         })
@@ -524,7 +631,7 @@ async def test_missing_fill_price_blocks_then_recovers_from_valid_evidence_witho
         "strategy_id": "good_etf", "idempotency_key": "recover-unpriced-fill",
         "weights": {SECURITY: "0.5"}, "marks": {SECURITY: "10"},
     }
-    submitted = await service.submit_targets(account, "default", request)
+    submitted = await submit_and_drain(service, account, "default", request)
     db = connect_database(service.database_path)
     try:
         order = db.execute("SELECT requested_qty, limit_price_units FROM strategy_orders").fetchone()
@@ -541,17 +648,17 @@ async def test_missing_fill_price_blocks_then_recovers_from_valid_evidence_witho
     }]
     for _ in range(2):
         with pytest.raises(RuntimeError, match="broker trade price is invalid") as caught:
-            await service.submit_targets(account, "default", request)
+            await submit_and_drain(service, account, "default", request)
         assert SECURITY in str(caught.value)
         assert "成交待核实" in str(caught.value)
-    with pytest.raises(RuntimeError, match="broker trade price is invalid"):
-        await service._resume_intent_locked(submitted["intent"]["intent_id"])
+    await service._resume_intent_locked(submitted["intent"]["intent_id"])
+    assert service.reconciliation.latest("qmt:default", "good_etf").state.value == "BLOCKED"
     assert broker.order_calls == 1 and broker.cancel_calls == []
 
     # A later real query supplies the price; never substitute a quote or 0.
     broker.trades[0]["price"] = actual_price
-    recovered = await service.submit_targets(account, "default", request)
-    await service.submit_targets(account, "default", request)
+    recovered = await submit_and_drain(service, account, "default", request)
+    await submit_and_drain(service, account, "default", request)
     assert recovered["reconciliation"]["state"] == "READY"
     assert recovered["intent"]["intent_id"] == submitted["intent"]["intent_id"]
     assert broker.order_calls == 1
@@ -578,7 +685,7 @@ async def test_submit_targets_is_idempotent_and_exposes_queries(api):
         "security_names": {SECURITY: "测试ETF"},
     }
 
-    first = await service.submit_targets(account, "default", request)
+    first = await submit_and_drain(service, account, "default", request)
     connection = connect_database(service.database_path)
     try:
         connection.execute(
@@ -588,7 +695,7 @@ async def test_submit_targets_is_idempotent_and_exposes_queries(api):
         connection.commit()
     finally:
         connection.close()
-    second = await service.submit_targets(account, "default", request)
+    second = await submit_and_drain(service, account, "default", request)
     intent_id = first["intent"]["intent_id"]
     restored = service.get_intent({"strategy_id": "good_etf"})
 
@@ -704,15 +811,15 @@ async def test_repeat_submit_observes_rejection_before_replanning(
             ExecutionRequest(style=LimitExecution(2_000))
         ),
     }
-    first = await service.submit_targets(account, "default", request)
+    first = await submit_and_drain(service, account, "default", request)
     assert broker.order_calls == 1
     broker.orders[0].update(status="rejected", status_msg=reason)
     broker.cash = 20000.0  # broker released the rejected order's reservation
 
-    second = await service.submit_targets(account, "default", request)
+    second = await submit_and_drain(service, account, "default", request)
     assert second["planned_orders"] == []
     assert broker.order_calls == 1
-    third = await service.submit_targets(account, "default", request)
+    third = await submit_and_drain(service, account, "default", request)
     assert broker.order_calls == expected_calls
     if expected_calls == 2:
         assert third["planned_orders"][0]["limit_price_units"] == first["planned_orders"][0]["limit_price_units"]
@@ -729,7 +836,7 @@ async def test_stock_original_limit_resumes_on_quote_entering_cage(api):
         account, "default", {"strategy_id": "good_etf", "initial_capital": 10000}
     )
     stock = "600000.XSHG"
-    result = await service.submit_targets(account, "default", {
+    result = await submit_and_drain(service, account, "default", {
         "strategy_id": "good_etf", "idempotency_key": "stock-cage-callback",
         "weights": {stock: "0.5"}, "marks": {stock: "10"},
         "execution": execution_request_to_wire(ExecutionRequest(style=LimitExecution(2_000))),
@@ -771,7 +878,7 @@ async def test_snapshot_books_fund_using_qmt_settlement_cycle(
     await service.ensure_account(
         account, "default", {"strategy_id": "good_etf", "initial_capital": 10000}
     )
-    await service.submit_targets(
+    await submit_and_drain(service,
         account,
         "default",
         {
@@ -842,7 +949,7 @@ async def test_conditional_target_is_resumed_by_native_tick_callback(
         {"strategy_id": "good_etf", "initial_capital": "10000"},
     )
 
-    result = await service.submit_targets(
+    result = await submit_and_drain(service,
         account,
         "default",
         {
@@ -1006,7 +1113,7 @@ async def test_idle_intent_can_be_canceled_before_risk_replacement(tmp_path):
         "default",
         {"strategy_id": "good_etf", "initial_capital": 10_000},
     )
-    submitted = await service.submit_targets(
+    submitted = await submit_and_drain(service,
         account,
         "default",
         {
@@ -1076,7 +1183,7 @@ async def test_midnight_expiry_cancels_working_order_and_closes_intent(tmp_path)
         "default",
         {"strategy_id": "good_etf", "initial_capital": 10_000},
     )
-    submitted = await service.submit_targets(
+    submitted = await submit_and_drain(service,
         account,
         "default",
         {
@@ -1139,7 +1246,7 @@ async def test_midnight_expiry_recovers_terminal_intent_with_working_order(
         "default",
         {"strategy_id": "good_etf", "initial_capital": 10_000},
     )
-    submitted = await service.submit_targets(
+    submitted = await submit_and_drain(service,
         account,
         "default",
         {
@@ -1187,7 +1294,7 @@ async def test_midnight_expiry_closes_day_order_left_working_in_broker_history(
         "default",
         {"strategy_id": "good_etf", "initial_capital": 10_000},
     )
-    submitted = await service.submit_targets(
+    submitted = await submit_and_drain(service,
         account,
         "default",
         {
@@ -1271,7 +1378,7 @@ async def _seed_sellable_position(api, monkeypatch, available):
 
     monkeypatch.setattr(service.data_provider, "get_tplus", get_tplus, raising=False)
     await service.ensure_account(account, "default", {"strategy_id": "good_etf"})
-    seed = await service.submit_targets(account, "default", {
+    seed = await submit_and_drain(service, account, "default", {
         "strategy_id": "good_etf", "idempotency_key": "seed-position",
         "weights": {SECURITY: 0.5}, "marks": {SECURITY: 10},
     })
@@ -1315,7 +1422,7 @@ async def _seed_sellable_position(api, monkeypatch, available):
 async def test_sellable_capacity_caps_sell_and_preserves_sell_before_buy(api, monkeypatch, available, expected):
     service, broker, account, notifications = api
     calls = await _seed_sellable_position(api, monkeypatch, available)
-    result = await service.submit_targets(account, "default", {
+    result = await submit_and_drain(service, account, "default", {
         "strategy_id": "good_etf", "idempotency_key": "rotate",
         "weights": {"510300.XSHG": 0.5}, "marks": {"510300.XSHG": 10},
         "execution": execution_request_to_wire(ExecutionRequest(sell_style=MarketExecution())),
@@ -1332,7 +1439,7 @@ async def test_sellable_capacity_caps_sell_and_preserves_sell_before_buy(api, mo
 async def test_sellable_recovery_tick_resumes_market_sell_once(api, monkeypatch):
     service, broker, account, _ = api
     calls = await _seed_sellable_position(api, monkeypatch, 0)
-    result = await service.submit_targets(account, "default", {
+    result = await submit_and_drain(service, account, "default", {
         "strategy_id": "good_etf", "idempotency_key": "wait-sell",
         "weights": {SECURITY: 0},
         "execution": execution_request_to_wire(ExecutionRequest(style=MarketExecution())),
@@ -1370,12 +1477,93 @@ async def test_pending_sell_waits_if_capacity_drops_before_dispatch(api, monkeyp
 
 
 @pytest.mark.asyncio
+async def test_unknown_sell_skips_tick_storm_and_recovers_only_exact_late_order(api, monkeypatch, caplog):
+    service, broker, account, notifications = api
+    await _seed_sellable_position(api, monkeypatch, 500)
+    service.planner.config = replace(service.planner.config, submission_timeout_seconds=0.02)
+    attempts = []
+
+    async def hung_submit(account, payload):
+        attempts.append(dict(payload))
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(broker, "place_order", hung_submit)
+    result = await submit_and_drain(service, account, "default", {
+        "strategy_id": "good_etf", "idempotency_key": "unknown-sell",
+        "weights": {SECURITY: 0},
+        "execution": execution_request_to_wire(ExecutionRequest(style=MarketExecution())),
+    })
+    assert len(attempts) == 1
+    latest = service.reconciliation.latest("qmt:default", "good_etf")
+    assert latest.state.value == "BLOCKED"
+    assert any(item.startswith("submission_result_unknown:" + SECURITY) for item in latest.details["blockers"])
+    assert "None" not in str(latest.details["blockers"])
+    assert "仅核对原委托" in next(n.detail for n in notifications if n.event == "ERROR")
+    blocked = [n for n in notifications if n.event == "RECONCILIATION_BLOCKED"]
+    assert len(blocked) == 1 and SECURITY in blocked[0].detail
+    assert "不自动重发" in blocked[0].detail
+    # Simulate the sellable-wait trigger that previously bypassed all guards.
+    service._sellable_waits["good_etf"] = {SECURITY: 0}
+    tick = MarketQuote(SECURITY, datetime.now(SHANGHAI_TZ))
+    refreshes = []
+    original_refresh = service._refresh
+
+    async def refresh(*args, **kwargs):
+        refreshes.append(True)
+        return await original_refresh(*args, **kwargs)
+
+    monkeypatch.setattr(service, "_refresh", refresh)
+    for _ in range(20):
+        await service._handle_quote(SECURITY, tick)
+    assert refreshes == []
+    # Changing unrelated observation counts must not resend the same blocker.
+    broker.orders.append({"order_id": "manual-unrelated", "security": "510300.XSHG",
+                          "side": "BUY", "status": "open", "order_remark": "manual"})
+    await service._handle_broker_event("default", "order")
+    await service._handle_broker_event("default", "trade")
+    assert len([n for n in notifications if n.event == "RECONCILIATION_BLOCKED"]) == 1
+    assert "callback task failed" not in caplog.text
+    assert len(attempts) == 1  # The seed's historical BUY never proves this SELL.
+    # Exact original tag recovers the SELL; no new submission is necessary.
+    broker.orders.append({"order_id": "late-sell", "security": SECURITY, "side": "SELL",
+                          "status": "open", "order_remark": attempts[0]["order_remark"]})
+    broker.positions[0]["closeable_amount"] = 0
+    await service._handle_broker_event("default", "order")
+    assert service.reconciliation.latest("qmt:default", "good_etf").state.value == "READY"
+    db = connect_database(service.database_path)
+    try:
+        assert tuple(db.execute("SELECT state, broker_order_id FROM strategy_orders WHERE side='SELL'").fetchone()) == ("SUBMITTED", "late-sell")
+    finally:
+        db.close()
+    assert len(attempts) == 1
+    assert service.planner.get_intent(result["intent"]["intent_id"]).state is IntentState.EXECUTING
+    broker.orders[-1]["status"] = "filled"
+    broker.trades.append({
+        "trade_id": "late-sell-fill", "trade_id_source": "broker", "order_id": "late-sell",
+        "security": SECURITY, "side": "SELL", "amount": 500, "price": 10,
+        "commission_fee": 5, "commission_known": True, "tax": 0, "tax_known": True,
+        "time": datetime.now(SHANGHAI_TZ).isoformat(),
+    })
+    broker.positions = []
+    broker.cash += 4995
+    await service._handle_broker_event("default", "trade")
+    await service._handle_broker_event("default", "trade")
+    assert service.planner.get_intent(result["intent"]["intent_id"]).state is IntentState.COMPLETED
+    assert len(attempts) == 1
+    db = connect_database(service.database_path)
+    try:
+        assert db.execute("SELECT COUNT(*) FROM fills WHERE broker_trade_id='late-sell-fill'").fetchone()[0] == 1
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
 async def test_real_total_position_shortage_still_blocks_before_dispatch(api, monkeypatch):
     service, broker, account, notifications = api
     calls = await _seed_sellable_position(api, monkeypatch, 0)
     broker.positions[0]["amount"] = 400
     with pytest.raises(RuntimeError, match="broker_position_insufficient"):
-        await service.submit_targets(account, "default", {
+        await submit_and_drain(service, account, "default", {
             "strategy_id": "good_etf", "idempotency_key": "missing-total",
             "weights": {SECURITY: 0},
         })

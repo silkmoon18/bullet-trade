@@ -154,6 +154,12 @@ def reconciliation_notification(
                 "**描述：** 差额超过当前对账允许的费用容差。",
                 "**处理提示：** 核对资金冻结、出入金、成交及费用记录。",
             ])
+        elif raw.startswith("submission_result_unknown:"):
+            lines.extend([
+                "**原因：** 券商下单提交结果未知，尚未取得柜台订单号。",
+                "**描述：** 超时或连接中断不代表下单失败，原委托可能已被柜台接收。",
+                "**处理提示：** 按原client_tag核对委托与成交；确认前不自动重发或继续调仓。",
+            ])
         else:
             reason = {
                 "capability": "券商接口能力验证未通过",

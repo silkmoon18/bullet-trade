@@ -542,7 +542,12 @@ class SQLiteReconciliationService:
                 OrderState.PARTIALLY_FILLED.value,
                 OrderState.SUBMIT_UNKNOWN.value,
             ) and local["order_id"] not in current_local_ids:
-                blockers.append("missing_working_order:{}".format(local["broker_order_id"]))
+                if local["state"] == OrderState.SUBMIT_UNKNOWN.value and not local["broker_order_id"]:
+                    blockers.append("submission_result_unknown:{}:local_order={}".format(
+                        local["security"], local["order_id"]
+                    ))
+                else:
+                    blockers.append("missing_working_order:{}".format(local["broker_order_id"]))
 
         required_cash, owned_positions, frozen_sell_qty = self._ledger_view(
             account_id, physical_account_id, snapshot.as_of

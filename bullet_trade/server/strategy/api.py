@@ -62,6 +62,10 @@ EXECUTION_QUOTE_HEARTBEAT_INTERVAL = timedelta(minutes=1)
 VALUATION_MARK_MAX_IDLE_AGE = timedelta(days=10)
 
 
+class ReconciliationNotReadyError(RuntimeError):
+    """Expected execution pause; the reconciliation notification explains it."""
+
+
 def _uses_quote_execution(
     request: ExecutionRequest, security: Optional[str] = None
 ) -> bool:
@@ -152,6 +156,8 @@ class SQLiteStrategyAPI:
         self._sellable_waits = {}
         self._dispatch_lock = asyncio.Lock()
         self._background_tasks = set()
+        self._submission_tasks = {}
+        self._closed = False
         self.repository = SQLiteStrategyRepository(self.database_path)
         self.repository.initialize()
         self.capital = SQLiteCapitalService(self.database_path)
@@ -271,6 +277,8 @@ class SQLiteStrategyAPI:
         account_key: str,
         payload: Mapping[str, object],
     ) -> Dict[str, object]:
+        if self._closed:
+            raise RuntimeError("StrategyLedger is shutting down")
         strategy_id = self._strategy_id(payload)
         self._bind_runtime(strategy_id, account_context, account_key)
         key = str(payload.get("idempotency_key") or "").strip()
@@ -301,13 +309,13 @@ class SQLiteStrategyAPI:
             account_context, account_key, strategy_id, payload, require_ready=True
         )
         if any(_uses_quote_execution(execution_request, security) for security in marks):
-            replace = getattr(
+            replace_quotes = getattr(
                 self.data_provider, "replace_execution_quotes", None
             )
             subscribe = getattr(
                 self.data_provider, "subscribe_execution_quotes", None
             )
-            if not callable(replace) and not callable(subscribe):
+            if not callable(replace_quotes) and not callable(subscribe):
                 raise RuntimeError(
                     "current data adapter has no native quote callback support"
                 )
@@ -330,6 +338,8 @@ class SQLiteStrategyAPI:
             self._record_reconciliation_rejections(
                 intent.intent_id, reconciliation, quotes
             )
+        if self._closed:
+            raise RuntimeError("StrategyLedger is shutting down")
         advance = self.planner.submit_target_weights(
             strategy_id,
             key,
@@ -341,33 +351,66 @@ class SQLiteStrategyAPI:
             quotes=quotes,
             security_names=security_names,
         )
-        if _uses_quote_execution(execution_request):
-            await self._sync_quote_subscriptions(strategy_id)
-        dispatched = []
-
-        async def submitter(order_payload: Mapping[str, object]) -> Mapping[str, object]:
-            return await cast(Any, self.broker).place_order(
-                account_context, dict(order_payload)
-            )
-
-        dispatched.extend(await self._dispatch_pending(submitter, strategy_id))
-
-        # Pick up immediate fills/rejections and make the returned view real.
-        refreshed, reconciliation, _ = await self._refresh(
-            account_context, account_key, strategy_id, payload
+        # No await between the durable plan and scheduling its server-owned
+        # execution. A client timeout/disconnect must not cancel broker submit.
+        intent_id = advance.intent.intent_id
+        self._queue_target_execution(intent_id, self._execute_accepted_target(
+            intent_id, account_context, account_key, dict(payload), quotes
+        ))
+        # Include reservations created by planning, but do not wait for a new
+        # broker observation. This is an acceptance snapshot, not a fill report.
+        accepted_snapshot = self.valuation.create_snapshot(
+            strategy_id, marks, snapshot.as_of, self._valuation_mark_max_age(snapshot.as_of)
         )
-        self._record_reconciliation_rejections(
-            advance.intent.intent_id, reconciliation, quotes
-        )
-        await self._sync_quote_subscriptions(strategy_id)
+        sellable = {p.security: p.sellable_qty for p in snapshot.positions}
+        accepted_snapshot = replace(accepted_snapshot, positions=tuple(
+            replace(p, sellable_qty=min(p.sellable_qty, sellable.get(p.security, 0)))
+            for p in accepted_snapshot.positions
+        ))
         return {
-            "intent": _json_value(self.planner.get_intent(advance.intent.intent_id)),
+            "intent": _json_value(self.planner.get_intent(intent_id)),
             "planned_orders": _json_value(advance.orders),
-            "dispatched_orders": _json_value(dispatched),
+            "dispatched_orders": [],
             "cancel_requested_order_ids": cancel_requested_order_ids,
-            "snapshot": self._snapshot_payload(refreshed),
+            "snapshot": self._snapshot_payload(accepted_snapshot),
             "reconciliation": _json_value(reconciliation),
         }
+
+    def _queue_target_execution(self, intent_id, awaitable):
+        existing = self._submission_tasks.get(intent_id)
+        if self._closed or (existing is not None and not existing.done()):
+            awaitable.close()
+            return
+        task = self._schedule_background(awaitable)
+        self._submission_tasks[intent_id] = task
+
+        def finished(done):
+            if self._submission_tasks.get(intent_id) is done:
+                self._submission_tasks.pop(intent_id, None)
+
+        task.add_done_callback(finished)
+
+    async def _execute_accepted_target(self, intent_id, account_context, account_key, payload, quotes):
+        strategy_id = self._strategy_id(payload)
+        async with self._resume_locks[strategy_id]:
+            await self._sync_quote_subscriptions(strategy_id)
+
+            async def submitter(order_payload):
+                return await cast(Any, self.broker).place_order(account_context, dict(order_payload))
+
+            await self._dispatch_pending(submitter, strategy_id)
+            # Immediate fills/rejections still enter the ledger, just outside
+            # the RPC. Later native callbacks drive any remaining orders.
+            _, reconciliation, _ = await self._refresh(account_context, account_key, strategy_id, payload)
+            self._record_reconciliation_rejections(intent_id, reconciliation, quotes)
+            await self._sync_quote_subscriptions(strategy_id)
+
+    async def close(self) -> None:
+        self._closed = True
+        tasks = tuple(self._background_tasks)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     async def startup_check(self, account_context: object, account_key: str) -> bool:
         physical_id = self._physical_id(account_key)
@@ -408,6 +451,9 @@ class SQLiteStrategyAPI:
         if self.startup_ready:
             for strategy_id in reconcile_ids:
                 await self._sync_quote_subscriptions(strategy_id)
+                if self.config.trading_enabled and self._can_dispatch_now():
+                    for intent in self.planner.active_intents(strategy_id):
+                        self._queue_target_execution(intent.intent_id, self._resume_intent(intent.intent_id))
         return self.startup_ready
 
     def get_intent(self, payload: Mapping[str, object]) -> Dict[str, object]:
@@ -686,7 +732,7 @@ class SQLiteStrategyAPI:
         # process-wide startup flag. Keep read-only snapshots available when
         # blocked, but stop before valuation/planning/cancellation/dispatch.
         if require_ready and reconciliation.state.value != "READY":
-            raise RuntimeError(
+            raise ReconciliationNotReadyError(
                 "StrategyLedger对账未就绪 | strategy_id={} | state={} | blockers={}".format(
                     strategy_id,
                     reconciliation.state.value,
@@ -747,11 +793,15 @@ class SQLiteStrategyAPI:
                         "QMT当前可卖={}；不足部分等待，不阻断整账户".format(limits[security])
                         if security in limits else "可卖限制已解除",
                     )
-        if (
-            self.notification_handler is not None
-            and result.state.value == "BLOCKED"
-            and (previous is None or previous.state.value != "BLOCKED" or previous.details != result.details)
-        ):
+        changed_blocker = (
+            result.state.value == "BLOCKED"
+            and (previous is None or previous.state.value != "BLOCKED"
+                 or previous.details.get("blockers") != result.details.get("blockers"))
+        )
+        if changed_blocker:
+            logger.warning("StrategyLedger执行暂停 | strategy_id=%s | blockers=%s",
+                           strategy_id, result.details.get("blockers", ()))
+        if changed_blocker and self.notification_handler is not None:
             try:
                 blockers = result.details.get("blockers", ())
                 if not isinstance(blockers, (list, tuple)):
@@ -945,10 +995,14 @@ class SQLiteStrategyAPI:
             self._handle_broker_event(account_key, event),
         )
 
-    def _schedule_background(self, awaitable) -> None:
+    def _schedule_background(self, awaitable):
+        if self._closed:
+            awaitable.close()
+            return None
         task = asyncio.create_task(awaitable)
         self._background_tasks.add(task)
         task.add_done_callback(self._background_done)
+        return task
 
     def _background_done(self, task: "asyncio.Task[object]") -> None:
         self._background_tasks.discard(task)
@@ -1027,6 +1081,15 @@ class SQLiteStrategyAPI:
         if quote is None:
             return
         for intent in self.planner.active_intents():
+            binding = self._runtime_bindings.get(intent.account_id)
+            lock = self._resume_locks.get(intent.account_id)
+            if binding is None or (lock is not None and lock.locked()):
+                continue
+            latest = self.reconciliation.latest(self._physical_id(binding[1]), intent.account_id)
+            if latest is not None and latest.state.value == "BLOCKED":
+                # A price tick cannot prove an unknown submission. Broker
+                # callbacks / explicit reconciliation can recover it instead.
+                continue
             waiting_sellable = security in self._sellable_waits.get(intent.account_id, {})
             if (
                 (not waiting_sellable and not _uses_quote_execution(intent.execution_request, security))
@@ -1125,17 +1188,16 @@ class SQLiteStrategyAPI:
             }
             for security, price_units in references.items()
         }
-        snapshot, reconciliation, market_marks = await self._refresh(
-            binding[0],
-            binding[1],
-            intent.account_id,
-            {
-                "marks": marks,
-                "weights": {security: 0 for security in intent.targets},
-                "as_of": now,
-            },
-            require_ready=True,
-        )
+        try:
+            snapshot, reconciliation, market_marks = await self._refresh(
+                binding[0], binding[1], intent.account_id,
+                {"marks": marks, "weights": {security: 0 for security in intent.targets}, "as_of": now},
+                require_ready=True,
+            )
+        except ReconciliationNotReadyError:
+            # The changed blocker already has one detailed notification.
+            # Do not treat a normal execution pause as a callback crash.
+            return
         self._record_reconciliation_rejections(
             intent_id, reconciliation, execution_quotes
         )

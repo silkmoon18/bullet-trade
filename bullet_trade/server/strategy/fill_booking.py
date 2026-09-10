@@ -246,6 +246,8 @@ class SQLiteFillBookingService:
                 OrderState.SUBMITTED.value,
                 OrderState.PARTIALLY_FILLED.value,
                 OrderState.FILLED.value,
+                OrderState.CANCELED.value,
+                OrderState.REJECTED.value,
             ):
                 current = self._order_from_row(row)
                 if current.broker_order_id != broker_order_id:

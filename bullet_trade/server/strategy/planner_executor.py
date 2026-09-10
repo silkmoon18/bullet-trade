@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 from dataclasses import dataclass
@@ -78,7 +79,8 @@ class PlannerConfig:
     limit_price_offset_ppm: int = 2_000
     max_age: timedelta = timedelta(minutes=5)
     working_order_timeout: timedelta = timedelta(minutes=10)
-    order_wait_timeout_seconds: float = 16.0
+    order_wait_timeout_seconds: float = 0.0
+    submission_timeout_seconds: float = 30.0
     trading_enabled: bool = False
     enabled_strategy_ids: Tuple[str, ...] = ()
     allow_buys: bool = True
@@ -100,9 +102,12 @@ class PlannerConfig:
             raise ValueError("working_order_timeout must be positive")
         if (
             type(self.order_wait_timeout_seconds) not in (int, float)
-            or not 0 < self.order_wait_timeout_seconds <= 120
+            or not 0 <= self.order_wait_timeout_seconds <= 120
         ):
-            raise ValueError("order_wait_timeout_seconds must be in (0, 120]")
+            raise ValueError("order_wait_timeout_seconds must be in [0, 120]")
+        if (type(self.submission_timeout_seconds) not in (int, float)
+                or not 0 < self.submission_timeout_seconds <= 120):
+            raise ValueError("submission_timeout_seconds must be in (0, 120]")
 
 
 @dataclass(frozen=True)
@@ -461,12 +466,27 @@ class SQLiteTargetExecutionService:
         account_id = self._order_account(claim.operation_id)
         self._operations.begin_submission(claim.outbox_id)
         try:
-            response = dict(await submitter(payload))
+            response = dict(await asyncio.wait_for(
+                submitter(payload), timeout=self.config.submission_timeout_seconds
+            ))
             broker_id = str(response.get("order_id") or response.get("broker_order_id") or "").strip()
             if not broker_id:
                 raise RuntimeError("broker response has no order id")
         except BaseException as exc:
+            # A concurrent snapshot may already have attached an exact-tag
+            # broker observation while the native submit response was delayed.
+            observed = self._find_order(claim.operation_id)
+            if observed is not None and observed["broker_order_id"]:
+                broker_id = str(observed["broker_order_id"])
+                self._operations.finish_submission(claim.outbox_id, {"order_id": broker_id})
+                if not isinstance(exc, Exception):
+                    raise
+                return DispatchResult(claim.operation_id, broker_id, False)
             error = "{}: {}".format(type(exc).__name__, str(exc))
+            if isinstance(exc, asyncio.TimeoutError):
+                error += " 券商提交超时（等待上限{}秒）；结果未知，仅核对原委托，不自动重发".format(
+                    self.config.submission_timeout_seconds
+                )
             try:
                 self._operations.finish_submission(
                     claim.outbox_id, {"error": error}, unknown=True

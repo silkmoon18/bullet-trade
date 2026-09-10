@@ -24,7 +24,8 @@ PlannerConfig(
     buy_fee_buffer_units=money_to_units("5"),
     limit_price_offset_ppm=2_000,
     working_order_timeout=timedelta(minutes=10),
-    order_wait_timeout_seconds=16,
+    order_wait_timeout_seconds=0,  # 返回订单号即入库，不等待成交
+    submission_timeout_seconds=30, # 提交超时记未知，不代表柜台拒单
 )
 ```
 

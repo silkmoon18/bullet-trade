@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import replace
 from datetime import date, datetime, timedelta
 
 import pytest
@@ -189,7 +190,7 @@ def test_dispatch_success_attaches_real_broker_order_id(tmp_path):
         assert payload["security"] == A
         assert payload["amount"] == 500
         assert payload["order_remark"].startswith("bt:")
-        assert payload["wait_timeout"] == 16.0
+        assert payload["wait_timeout"] == 0.0
         return {"order_id": "broker-100", "status": "submitted"}
 
     result = asyncio.run(planner.dispatch_next(submit))
@@ -242,6 +243,34 @@ def test_dispatch_exception_becomes_submit_unknown_and_is_not_retried(tmp_path):
         assert connection.execute("SELECT state FROM strategy_orders").fetchone()[0] == "SUBMIT_UNKNOWN"
     finally:
         connection.close()
+
+
+@pytest.mark.parametrize("terminal", [None, OrderState.REJECTED, OrderState.CANCELED])
+@pytest.mark.parametrize("lost_response", [False, True])
+def test_delayed_submit_response_does_not_regress_already_observed_order(tmp_path, terminal, lost_response):
+    database, repository, _, _, planner, snapshot, marks, as_of = _setup(tmp_path)
+    planned = planner.submit_target_weights(ACCOUNT, "early-callback", {A: 0.5}, snapshot, marks, as_of)
+    planner.config = replace(planner.config, submission_timeout_seconds=0.01)
+    booking = SQLiteFillBookingService(database)
+
+    async def submit(_):
+        booking.mark_order_submitted(ACCOUNT, planned.orders[0].order_id, "early-id")
+        if terminal is not None:
+            booking.finalize_order(ACCOUNT, planned.orders[0].order_id, terminal,
+                                   repository.get_strategy_account(ACCOUNT).ledger_version)
+        if lost_response:
+            await asyncio.Event().wait()
+        return {"order_id": "early-id"}
+
+    result = asyncio.run(planner.dispatch_next(submit))
+    assert result.unknown is False and result.broker_order_id == "early-id"
+    db = connect_database(database)
+    try:
+        assert db.execute("SELECT state FROM strategy_orders").fetchone()[0] == (terminal or OrderState.SUBMITTED).value
+        assert db.execute("SELECT state FROM strategy_operations").fetchone()[0] == "COMPLETED"
+        assert db.execute("SELECT state FROM outbox").fetchone()[0] == "DONE"
+    finally:
+        db.close()
 
 
 def _add_position(database, capital, acquired_day, sellable_day):
