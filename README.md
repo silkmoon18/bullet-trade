@@ -12,6 +12,8 @@
 
 简体中文 | [完整文档](docs/index.md)
 
+本 fork 的聚宽双账户/策略账本用户：[大 QMT 本机桥接（替代 miniQMT）](docs/big-qmt-bridge.md)。使用 fork 专属 helper 和配置，不以官方接管示例覆盖现有策略。
+
 ## ✨ 核心特性
 
 - **🔄 聚宽兼容**：`from jqdata import *`

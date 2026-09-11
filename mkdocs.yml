@@ -44,6 +44,8 @@ nav:
       - 聚宽接管设计说明: joinquant-live-takeover.md
       - 邀请贡献: contributing.md
   - 聚宽实盘策略账本（开发中）:
+      - 大 QMT 本机桥接: big-qmt-bridge.md
+      - 上游合并与桥接计划: live-ledger/43-big-qmt-bridge-plan.md
       - 当前状态与使用指南: live-ledger/07-status-and-usage.md
       - 改造文档索引: live-ledger/README.md
       - 当前架构、依赖与状态: live-ledger/00-current-state.md

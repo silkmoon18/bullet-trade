@@ -1,5 +1,7 @@
 # 大 QMT：两种接入方式
 
+本页介绍上游 HTTP 网关。本 fork 已有 StrategyLedger/JQ 双账户的用户，改用完整 QMT 时请看[本机回调桥接](big-qmt-bridge.md)，不要覆盖现有 fork helper。
+
 这是当前推荐的 QMT 接入方式。只需要先在大 QMT 中运行一个网关策略，再根据策略运行位置选择下面两条路线之一：
 
 - **聚宽运行策略**：聚宽策略通过互联网连接家里或办公室的 BulletTrade 服务。
