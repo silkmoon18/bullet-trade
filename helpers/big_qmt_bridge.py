@@ -72,20 +72,29 @@ def _security(row):
     return _jq(str(_get(row, "m_strInstrumentID", "")) + "." + str(_get(row, "m_strExchangeID", "")))
 
 
+def _id(value):
+    text = str(value or "").strip()
+    return "" if text in ("0", "-1") else text
+
+
 def _date_time(row, date_field, time_field):
     day, clock = str(_get(row, date_field, "")), str(_get(row, time_field, ""))
     if not day or not clock:
         return None
-    return day.replace("-", "") + clock.replace(":", "").zfill(6)
+    text = day.replace("-", "") + clock.replace(":", "").zfill(6)
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.strptime(text, "%Y%m%d%H%M%S"))
+    except ValueError:
+        return None
 
 
 def _order(row):
-    remark = _get(row, "m_strRemark") or _get(row, "m_strUserOrderId", "")
+    remark = _get(row, "m_strRemark") or _get(row, "m_strUserOrderId") or _get(row, "m_strOrderRemark", "")
     return dict(
-        order_id=str(_get(row, "m_strOrderSysID", "") or ""), security=_security(row),
+        order_id=_id(_get(row, "m_strOrderSysID")), security=_security(row),
         amount=_get(row, "m_nVolumeTotalOriginal"), filled=_get(row, "m_nVolumeTraded"),
         raw_status=_get(row, "m_nOrderStatus"), side={23: "BUY", 24: "SELL"}.get(_get(row, "m_nOpType"), ""),
-        price=_get(row, "m_dLimitPrice"), order_price=_get(row, "m_dLimitPrice"),
+        price=_get(row, "m_dTradedPrice"), order_price=_get(row, "m_dLimitPrice"),
         order_remark=remark, remark=remark, qmt_user_order_id=remark,
         order_time=_date_time(row, "m_strInsertDate", "m_strInsertTime"),
         status_message=_get(row, "m_strCancelInfo") or _get(row, "m_strErrorMsg"), raw=_raw(row),
@@ -93,10 +102,10 @@ def _order(row):
 
 
 def _trade(row):
-    remark = _get(row, "m_strRemark") or _get(row, "m_strUserOrderId", "")
+    remark = _get(row, "m_strRemark") or _get(row, "m_strUserOrderId") or _get(row, "m_strOrderRemark", "")
     return dict(
-        trade_id=str(_get(row, "m_strTradeID", "") or ""),
-        order_id=str(_get(row, "m_strOrderSysID", "") or ""), security=_security(row),
+        trade_id=_id(_get(row, "m_strTradeID")),
+        order_id=_id(_get(row, "m_strOrderSysID")), security=_security(row),
         amount=_get(row, "m_nVolume"), price=_get(row, "m_dTradePrice") or _get(row, "m_dPrice"),
         side={23: "BUY", 24: "SELL"}.get(_get(row, "m_nOpType"), ""),
         time=_date_time(row, "m_strTradeDate", "m_strTradeTime"),
@@ -206,7 +215,7 @@ class BridgeRuntime:
         if action == "/positions":
             return [dict(security=_security(row), amount=_get(row, "m_nVolume"),
                          closeable_amount=_get(row, "m_nCanUseVolume"), cost_basis=_get(row, "m_dOpenPrice"),
-                         market_value=_get(row, "m_dInstrumentValue"), raw=_raw(row)) for row in self.rows("position")]
+                         market_value=_get(row, "m_dMarketValue"), raw=_raw(row)) for row in self.rows("position")]
         if action in ("/orders", "/order_status"):
             rows = [_order(row) for row in self.rows("order")]
             if action == "/order_status":

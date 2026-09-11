@@ -105,9 +105,9 @@ _ORDER_STATUS_MAP = {
     50: "open",
     51: "open",
     52: "partly_filled",
-    53: "partly_filled",
-    54: "partly_canceled",
-    55: "cancelled",
+    53: "partly_canceled",
+    54: "cancelled",
+    55: "partly_filled",
     56: "filled",
     57: "rejected",
     86: "cancelled",
@@ -1684,6 +1684,12 @@ class BigQmtBrokerAdapter(RemoteBrokerAdapter):
 
 
 def build_big_qmt_bundle(config: ServerConfig, router: AccountRouter) -> AdapterBundle:
+    transport = (get_env("BIG_QMT_TRANSPORT", "http") or "http").lower()
+    if transport == "bridge":
+        from .big_qmt_bridge import build_bridge_bundle
+        return build_bridge_bundle(config, router)
+    if transport != "http":
+        raise ValueError("BIG_QMT_TRANSPORT must be http or bridge")
     gateway_config = load_big_qmt_gateway_config(config)
     client = BigQmtGatewayClient(gateway_config)
     data_adapter = BigQmtDataAdapter(client) if config.enable_data else None

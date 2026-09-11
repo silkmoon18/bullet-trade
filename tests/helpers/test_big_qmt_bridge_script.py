@@ -86,11 +86,15 @@ def test_native_fields_and_unknown_fee_are_not_invented(script):
                m_strExchangeID="SH", m_nOpType=23, m_nVolume=100, m_dTradePrice=1.002,
                m_strTradeDate="20260912", m_strTradeTime="09:30:01", m_strRemark="bt:test")
     trade = script._trade(row)
-    assert (trade["trade_id"], trade["order_id"], trade["time"]) == ("real-trade", "real-order", "20260912093001")
+    assert (trade["trade_id"], trade["order_id"], trade["time"]) == ("real-trade", "real-order", "2026-09-12 09:30:01")
     assert trade["commission_fee"] is None and trade["commission_known"] is False
     assert trade["tax"] is None and trade["tax_known"] is False
     assert script._trade({})["time"] is None
     assert script._order({})["order_id"] == ""
+    assert script._order({"m_strOrderSysID": "0"})["order_id"] == ""
+    assert script._trade({"m_strTradeID": -1})["trade_id"] == ""
+    order = script._order({"m_dLimitPrice": 1.002, "m_dTradedPrice": 1.001, "m_strOrderRemark": "bt:tag"})
+    assert (order["price"], order["order_price"], order["order_remark"]) == (1.001, 1.002, "bt:tag")
 
 
 def test_tick_batch_subscription_lifecycle_and_callback_filter(script):
