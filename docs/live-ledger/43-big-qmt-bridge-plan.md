@@ -41,3 +41,10 @@
 - 扩展 core/unit 全量收集遇到三项外部私有模块缺失：test_live_engine.py、test_formal_runtime_retry.py、test_v2_bridge.py 依赖仓外 strategies/bt_strategies；不伪造依赖或宣称全套通过。
 - 上游不再使用 broker RPC 的 TTL 淘汰，保留进程内稳定幂等与容量限制；fork 的策略目标持久幂等不变。
 - 下一切片只增加可选桥接传输，保留上游 HTTP 大 QMT 后端作为兼容路径。
+
+### S2 审查
+
+- 增加 localhost 单连接命令/事件通道和可复制的大 QMT 单文件；500ms 原生定时器非阻塞收发，无后台 Python 线程或 HTTP 阻塞循环。
+- 17 项离线测试通过：握手账户匹配、断线未知态、不重发、写入边界、原价/prType 保留、回报时间/费用未知、行情批次、停止释放及 GBK/UTF-8 双兼容。
+- 自审修正：仅缓存写命令防重复，查询不积累缓存；缓存满拒绝写入而不淘汰未知命令。passorder 返回值绝不当作真实订单号。
+- 下一切片接入适配器和现有历史库，暂未接真实 QMT 验证。
