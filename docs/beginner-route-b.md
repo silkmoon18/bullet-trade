@@ -1,525 +1,177 @@
-# 方案 B：策略在聚宽侧模拟盘运行
+# 把你的聚宽策略接入大 QMT
 
 > **当前 fork 提示：** 本页涉及 `bullet_trade_jq_remote_helper.configure(...)` 的步骤属于上游历史方案，L00 后已不可用。聚宽继续负责策略信号，但真实下单将由 L02/L03 的 StrategyLedger API 完成；实施状态见 [个人量化精简计划](live-ledger/15-lean-personal-plan.md)。
 
 [返回新手入门总览](beginner-guide.md)
 
-这一条路的意思是：
+**先用 QMT 仿真账号练习。聚宽虽然叫“模拟盘”，接到 QMT 实盘账号后，下单就会使用真实资金。**
 
-- 策略逻辑继续放在聚宽侧跑
-- 聚宽负责选股、择时和生成买卖动作
-- BulletTrade 负责把这些动作转发到本地或云端 Windows QMT / MiniQMT 机器执行
+## 1. 在 Windows 上准备 BulletTrade
 
-本页默认用 MiniQMT/xtquant 启动远程 `bullet-trade server`。如果券商不再提供 MiniQMT，也可以先按 [大 QMT 服务向导](big-qmt-server.md) 在大 QMT 里启动 helper，再启动 `bullet-trade server --server-type big_qmt`；聚宽侧 helper 仍然连接同一个 `58620` qmt server。
+准备一台能登录大 QMT 的 Windows 电脑，并安装 Python。还没安装的，先看[Python 安装步骤](python-setup.md)。
 
-新手先按这条链路理解：
+打开 Windows 命令提示符（cmd），执行：
 
-```text
-聚宽模拟盘策略 -> bullet_trade_jq_remote_helper.py -> bullet-trade server -> QMT / MiniQMT / 大 QMT -> 券商
+```bat
+python -m pip install -U --pre bullet-trade
 ```
 
-这里最容易弄错的是网络方向：  
-**不是 QMT 主动连聚宽，而是聚宽侧 helper 主动访问你的 `bullet-trade server`。**
+这条命令安装最新发布版本，包含 Beta 版，不需要填写版本号。
 
-所以只要策略继续在聚宽侧运行，不管后面选择哪种策略修改方案，聚宽都必须能访问 `bullet-trade server` 的地址和端口。
+## 2. 启动大 QMT 和 BulletTrade 服务
 
-这条路线适合：
+在大 QMT 中：
 
-- 复杂策略现在就在聚宽侧跑
-- 你短期目标是先接通实盘，不是先把策略全部本地化
-- 策略依赖聚宽侧研究环境、平台权限表、复杂选股或财务链路
-- 你暂时判断不清哪些函数兼容、哪些函数不兼容
+1. 新建 Python 策略，将[网关文件](https://github.com/BulletTrade/bullet-trade/blob/main/helpers/big_qmt_gateway_strategy_sample.py)的完整内容复制进去。
+2. 找到顶部的 `GATEWAY_PASSWORD`，改成自己设置的一段密码并保存。下载文件导入时保持 GBK 编码。
+3. 新建“策略交易”运行项，选择该策略和仿真账号。主图代码可填 `000300`，周期选日线，**不要勾选“启动本地 Python”**，然后运行。
 
-## 总流程图
+<img src="assets/big-qmt-4-new-server.png" alt="在大 QMT 中选择网关策略和资金账号并创建运行项" width="760">
 
-```mermaid
-flowchart TD
-    A["购买 Windows 云服务器"] --> B["安装 QMT"]
-    B --> C["选择独立交易启动 QMT"]
-    C --> D["安装 Python 环境"]
-    D --> E["安装带 qmt 扩展的 BulletTrade"]
-    E --> F["配置 .env"]
-    F --> G["启动 bullet-trade server"]
-    G --> H["研究里上传 helper 和测试 notebook"]
-    H --> I["在聚宽研究里做远程调试"]
-    I --> J["修改聚宽模拟策略"]
-    J --> K["选择策略修改方案 1 或 2"]
-    K --> L["在聚宽模拟环境运行策略"]
-```
+日志出现 `listen success listen=127.0.0.1:9000`，说明网关启动。找不到界面可对照[完整截图](big-qmt-server.md)。
 
-## 第一章：准备 Windows 云服务器和 QMT / MiniQMT
-
-这台 Windows 机器可以是：
-
-- 你自己的 Windows 电脑
-- Windows 云服务器
-
-如果你打算长期远程跑，建议直接用 Windows 云服务器。  
-例如：
-
-- 阿里云 Windows 云服务器
-- 腾讯云 Windows 云服务器
-
-新手起步时，服务器一般用 `2C 4G`、`3M` 带宽、带独立公网 IP 就够了。  
-常见活动价通常在几十元到两百元一年这个区间，具体还是以各家云厂商当期活动页为准。
-
-在这台机器上，你要先完成 3 件事：
-
-1. 安装 QMT
-2. 启动支持 MiniQMT 的 QMT 环境
-3. 登录 QMT 账号
-
-如果使用大 QMT，不需要 `userdata_mini` 和 xtquant 本地数据目录这条配置链路；需要在大 QMT 里新建并运行 helper 策略，具体见 [大 QMT 服务向导](big-qmt-server.md)。
-
-MiniQMT 和大 QMT 的 Windows 侧启动方式不同，但聚宽侧看到的入口应保持一致：
-
-| Windows 侧后端 | Windows 侧做什么 | 聚宽侧连接什么 |
-| --- | --- | --- |
-| MiniQMT / xtquant | 配 `QMT_DATA_PATH`，启动 `bullet-trade server` | `bullet-trade server` 的 `58620` |
-| 大 QMT helper | 先在大 QMT 里运行 helper，再启动 `bullet-trade server --server-type big_qmt` | 仍然是 `bullet-trade server` 的 `58620` |
-
-大 QMT helper 的内部端口，例如 `9000`，不要给聚宽直接连。
-
-### 建议的基础准备
-
-- 已按 [环境准备：先安装 Python，再创建虚拟环境](python-setup.md) 完成 Python 安装
-- 已安装并登录的 QMT，并且该环境支持 MiniQMT
-- 一台可以运行 QMT / MiniQMT 的 Windows 机器
-- 如果要远程连这台机器，还要能配置防火墙和公网访问
-
-这里有两个关键要求：
-
-- 后面的本地取数和远程 server 都默认你能访问 `userdata_mini`
-- 登录时请选择 **独立交易** 方式启动 QMT
-
-可以参考下面这两张图：
-
-![MiniQMT 启动入口](assets/mini_qmt.png)
-
-![登录时选择独立交易](assets/miniqmt_login.png)
-
-到这一步，你的目标只有一个：**先让 QMT 在这台 Windows 机器上稳定登录。**
-
-
-## 第二章：安装 Python 和 BulletTrade
-
-如果这台机器还没有 Python，先完成：
-
-- [环境准备：先安装 Python，再创建虚拟环境](python-setup.md)
-
-这台机器要直接连接本地 QMT，并且要启动 `bullet-trade server`，所以建议直接安装带 QMT 扩展的版本：
-
-```bash
-pip install "bullet-trade[qmt]"
-```
-
-如果你还不知道 `.env` 是什么，或者不知道怎么在 Windows 里创建这个文件，先看：
-
-- [什么是 `.env` 文件，怎么创建](python-setup.md#env-file)
-
-## 第三章：配置并启动远程 `bullet-trade server`
-
-下面是 MiniQMT/xtquant 后端的配置。大 QMT 后端不要写 `QMT_DATA_PATH`，请按 [大 QMT 服务向导](big-qmt-server.md) 使用 `BIG_QMT_GATEWAY_URL` 和 `--server-type big_qmt`。
-
-先准备 `.env` 文件。  
-下面这个代码块不是命令，而是要写进 `.env` 文件里的内容：
+在 Windows 新建一个文件夹，在里面创建 `.env.bigqmt` 文件，用记事本写入以下内容。注意文件名不要变成 `.env.bigqmt.txt`：
 
 ```env
-QMT_DATA_PATH=C:\QMT\userdata_mini
-QMT_ACCOUNT_ID=123456
-QMT_SERVER_TOKEN=secret
+QMT_ACCOUNT_ID=你的QMT资金账号
+QMT_SERVER_TOKEN=自己设置的一段较长随机令牌
+BIG_QMT_GATEWAY_PASSWORD=刚才在大QMT填写的密码
+QMT_SERVER_PORT=58620
 ```
 
-然后启动：
+前三项换成自己的值。`token` 是自己设置的连接令牌，不是券商交易密码。
 
-```bash
-bullet-trade --env-file .env server --listen 0.0.0.0 --port 58620 --enable-data --enable-broker
+在这个文件夹的地址栏输入 `cmd`，按回车，执行：
+
+```bat
+bullet-trade --env-file .env.bigqmt server --server-type big_qmt --listen 0.0.0.0
 ```
 
-请注意：
+保持这个窗口和大 QMT 运行，不要关闭或让电脑休眠。
 
-- 不要写 `--data-path`
-- 账号、数据目录、token 都放在 `.env`
+## 3. 在聚宽填写连接信息，查一下账户
 
-启动成功后，你应该能看到服务监听日志。
+你需要知道三个值：**服务器地址、入口端口、token**。如果有人帮你部署，向对方索取即可。
 
-![Server 日志示意](assets/joinquant-server-qmt.png)
+- 默认端口是 `58620`。要改服务端口，修改上面的 `QMT_SERVER_PORT` 并重启该服务。
+- 如果公网端口 `15862` 映射到 Windows 的 `58620`，聚宽填 `15862`。
+- 地址只填域名或 IP，不加 `http://`；不要填 `127.0.0.1`。大 QMT 内部的 `9000` 不给聚宽使用。
 
-## 第四章：放通端口，确认外网能访问
+服务启动不会自动打通网络。以下按已准备好可达入口操作；跨公网的安全连接由部署时配置，详见[服务向导](big-qmt-server.md)，不要直接暴露未加密的交易服务。
 
-如果你用的是 Windows 云服务器，到这一步必须确认端口已经放通。  
-这里通常要同时检查两层：
+下载[聚宽连接文件](https://github.com/BulletTrade/bullet-trade/blob/main/helpers/bullet_trade_jq_remote_helper.py)，保持文件名 `bullet_trade_jq_remote_helper.py`，上传到**聚宽研究根目录**。不用把这个文件的内容粘进自己的策略。
 
-1. 云平台安全组 / 防火墙
-2. Windows 自带防火墙
-
-### 云平台要放通什么
-
-对新手来说，最小要求就是：
-
-- 放通入站 `TCP`
-- 端口 `58620`
-
-如果你用的是：
-
-- 阿里云：到云服务器对应的安全组里放通 `58620/TCP`
-- 腾讯云：到云服务器对应的安全组或轻量服务器防火墙里放通 `58620/TCP`
-
-### Windows 本机也要放通
-
-如果 Windows 第一次启动 `bullet-trade server` 时弹出了防火墙提示，要允许放行。  
-如果没有弹窗，就手动到 Windows Defender 防火墙里检查这台机器是否已经允许该端口或该程序。
-
-![Windows 防火墙放行示意](assets/server-firewall.png)
-
-### 怎么测试端口通不通
-
-先在 Windows 云服务器本机检查服务有没有监听：
-
-```bash
-netstat -ano | findstr 58620
-```
-
-如果你看到 `0.0.0.0:58620` 或对应端口的监听信息，说明服务已经在本机起来了。
-
-然后在你自己的另一台机器上测试公网端口是否能打通。
-
-Windows PowerShell 可以用：
-
-```powershell
-Test-NetConnection your.server.ip -Port 58620
-```
-
-macOS / Linux 可以用：
-
-```bash
-nc -vz your.server.ip 58620
-```
-
-如果测试通过，通常会看到：
-
-- `TcpTestSucceeded : True`
-- 或者 `succeeded`
-
-如果本机测试通、外网测试不通，优先看安全组、防火墙、端口映射。  
-如果外网端口通，但聚宽 helper 仍连不上，优先检查 `host`、`port`、`token` 是否和服务端一致。
-
-## 第五章：把 helper 和测试 notebook 上传到聚宽研究根目录
-
-如果你前面是在 Windows 云服务器上启动了 QMT 和 `bullet-trade server`，到这里就先不要动云服务器那边了。  
-保持：
-
-- QMT 已按独立交易方式登录
-- `bullet-trade server` 正在运行
-
-然后切到聚宽侧继续下面的联调。
-
-仓库里已经提供了现成文件：
-
-- `helpers/bullet_trade_jq_remote_helper.py`
-  下载链接：[bullet_trade_jq_remote_helper.py](https://github.com/BulletTrade/bullet-trade/blob/main/helpers/bullet_trade_jq_remote_helper.py)
-- `helpers/jq_remote_strategy_example.py`
-  下载链接：[jq_remote_strategy_example.py](https://github.com/BulletTrade/bullet-trade/blob/main/helpers/jq_remote_strategy_example.py)
-- `bullet_trade/notebook/04.joinquant_remote_live_trade.ipynb`
-  下载链接：[04.joinquant_remote_live_trade.ipynb](https://github.com/BulletTrade/bullet-trade/blob/main/bullet_trade/notebook/04.joinquant_remote_live_trade.ipynb)
-
-这里要分清楚两个位置：
-
-- **聚宽研究根目录**：上传 `bullet_trade_jq_remote_helper.py` 和 `04.joinquant_remote_live_trade.ipynb`
-- **聚宽策略**：`jq_remote_strategy_example.py` 不需要上传到研究里，它是“策略怎么修改”的参考文件，应该放到聚宽策略里参考或对照修改
-
-建议上传到 **聚宽研究根目录** 的文件只有：
-
-- `bullet_trade_jq_remote_helper.py`
-- `04.joinquant_remote_live_trade.ipynb`
-
-上传位置尽量就是研究根目录，不要先放到别的子目录。  
-这样后面在聚宽里直接写：
-
-```python
-import bullet_trade_jq_remote_helper as bt
-```
-
-就能直接找到文件。
-
-![聚宽研究环境里已看到 helper 文件](assets/joinquant-sever-reserch.png)
-
-## 第六章：先在聚宽研究 / Jupyter 里做一次远程调试
-
-这里说的调试，是在 **聚宽自己的研究环境 / Jupyter 页面** 里做。  
-不是在我们本地再开一个 `bullet-trade lab`。
-
-你可以用两种方式：
-
-- 或者直接打开刚上传的 `04.joinquant_remote_live_trade.ipynb`，在聚宽研究 / Jupyter 里测试 helper
-- 或者在聚宽研究 / Jupyter 里新建一个测试文件，把下面这段代码粘进去
-
-如果你是第一次联调，优先建议直接用这个 notebook。  
-它更适合做“先连通、先查账户、先查持仓”的最小验证。
-
-先做最小检查：
+在聚宽研究中新建 Python Notebook，复制下面代码，填好三个值后运行：
 
 ```python
 import bullet_trade_jq_remote_helper as bt
 
 bt.configure(
-    host="your.server.ip",
-    port=58620,
-    token="secret",
-    debug=True,
+    host="你的服务器地址",
+    port=58620,  # 有端口映射时填外部入口端口
+    token="你的QMT_SERVER_TOKEN",
 )
-
-acct = bt.get_account()
-positions = bt.get_positions()
-
-print("可用资金:", acct.available_cash)
-print("总资产:", acct.total_value)
-print("持仓数量:", len(positions))
+print("可用资金:", bt.get_account().available_cash)
+print("持仓数量:", len(bt.get_positions()))
 ```
 
-你第一次联调时，重点看两个地方：
+这段代码不会下单。**看到资金和持仓数量，并与 QMT 一致，才继续下一步。** 如果导入失败，检查文件名和上传位置；如果连接失败，检查地址、端口、token 及 Windows 服务。
 
-- 聚宽研究 / Jupyter 页面里，是否已经成功打印出账户和持仓
-- Windows 云服务器上的 `bullet-trade server` 日志里，是否已经出现新的连接和访问日志
+## 4. 选择一种方式修改原策略
 
-如果聚宽这边运行了代码，但云服务器上完全没有新日志，优先怀疑：
+先复制一份原策略，保留原版。下面两种方式选一种，不要一起复制。
 
-- 公网 IP 写错
-- 端口没放通
-- token 不一致
-- 云服务器安全组或 Windows 防火墙没放行
+### 方案 1：逐个改下单接口
 
-![聚宽研究 / Jupyter 中成功打印账户和持仓](assets/joinquant-jupyter-test.png)
+适合下单点少、希望明确控制每个交易点的策略。直接的 `bt.order()` 不会判断回测，所以要用下面的函数区分：回测走聚宽，模拟盘走 QMT。
 
-## 第七章：选择聚宽侧策略修改方案
-
-把聚宽策略接到 BulletTrade，有两种策略修改方案。这里说的是“策略代码怎么改”，不是网络怎么接入；不管选哪种，聚宽侧都要能访问同一个 `bullet-trade server`。
-
-| 策略修改方案 | 文档 | 特点 |
-| --- | --- | --- |
-| 策略修改方案 1：显式调用 helper | [策略修改方案 1：显式调用 helper](joinquant-helper-explicit.md) | 下单处改成 `bt.order(...)`、`bt.order_target_value(...)`，行为清楚，改动较多 |
-| 策略修改方案 2：接管聚宽函数 | [策略修改方案 2：接管聚宽函数](joinquant-live-takeover-usage.md) | 在 `process_initialize` 安装兼容层，原策略的 `order(...)`、`context.portfolio` 尽量不改 |
-
-建议：
-
-- 第一次联调先用策略修改方案 1 在聚宽研究里查通账户和持仓。
-- 正式迁移存量聚宽模拟盘策略，优先看策略修改方案 2。
-- 如果策略只有一两个下单点，并且不依赖聚宽虚拟盘的现金和持仓判断，策略修改方案 1 也可以长期使用。
-
-更完整的优缺点对比见 [聚宽策略修改方案对比](joinquant-integration-options.md)。
-
-下面保留的是策略修改方案 1 的手动替换说明；如果你采用策略修改方案 2，直接看 [策略修改方案 2：接管聚宽函数](joinquant-live-takeover-usage.md)。
-
-### 策略修改方案 1：显式调用 helper 的改法
-
-很多用户卡在这里。  
-核心原则其实很简单：
-
-- **选股和信号逻辑尽量不动**
-- **真正的买卖动作改成调用 helper**
-
-如果你不知道策略文件该怎么改，可以把下面这个参考文件上传到 **聚宽策略** 里，对照着改你自己的策略：
-
-- [jq_remote_strategy_example.py](https://github.com/BulletTrade/bullet-trade/blob/main/helpers/jq_remote_strategy_example.py)
-
-#### 1. 文件头上要加什么
-
-这里建议你把文档理解成：  
-**保留你原来策略文件顶部的平台导入和原有逻辑，只新增 helper 相关代码。**
-
-你需要新增的是：
-
-```python
-import bullet_trade_jq_remote_helper as bt
-```
-
-如果你原来的策略文件已经能在平台侧正常运行，这里不要先去大改原来的导入。
-
-#### 2. 远程服务器参数放在哪里
-
-建议直接写在策略文件开头，先用最直白的方式跑通：
-
-```python
-BT_REMOTE_HOST = "your.server.ip"
-BT_REMOTE_PORT = 58620
-BT_REMOTE_TOKEN = "secret"
-```
-
-#### 3. 初始化时要加什么
-
-聚宽环境会重启、刷新代码，所以更稳的写法是：  
-**在 `process_initialize` 里做 `bt.configure(...)`。**
-
-最小写法：
+在原策略的 `from jqdata import *` 等导入后添加：
 
 ```python
 import bullet_trade_jq_remote_helper as bt
 
-BT_REMOTE_HOST = "your.server.ip"
-BT_REMOTE_PORT = 58620
-BT_REMOTE_TOKEN = "secret"
+
+def _use_bt(context):
+    """根据聚宽 context 返回是否访问 QMT；未知运行环境抛错。"""
+    mode = context.run_params.type
+    if mode == "sim_trade":
+        return True
+    if mode in ("simple_backtest", "full_backtest"):
+        return False
+    raise RuntimeError("无法识别运行环境: %s" % mode)
 
 
 def process_initialize(context):
-    bt.configure(
-        host=BT_REMOTE_HOST,
-        port=BT_REMOTE_PORT,
-        token=BT_REMOTE_TOKEN,
-    )
+    """输入聚宽 context，仅在模拟盘配置远程连接；无返回值。"""
+    if _use_bt(context):
+        bt.configure(
+            host="你的服务器地址",
+            port=58620,
+            token="你的QMT_SERVER_TOKEN",
+        )
 
 
-def initialize(context):
-    set_benchmark("000300.XSHG")
+def my_order_target_value(context, code, value):
+    """按运行环境提交目标金额委托，返回远程订单号或聚宽订单对象。"""
+    if _use_bt(context):
+        return bt.order_target_value(code, value)
+    return order_target_value(code, value)
 ```
 
-#### 4. 买卖的时候改哪些函数
-
-最常见就是把聚宽原来的下单函数，替换成 helper 对应函数。
-
-常见替换关系：
-
-- `order(...)` 改成 `bt.order(...)`
-- `order_value(...)` 改成 `bt.order_value(...)`
-- `order_target(...)` 改成 `bt.order_target(...)`
-- `order_target_value(...)` 改成 `bt.order_target_value(...)`
-
-例如，原来你可能是：
+然后把原来的下单语句：
 
 ```python
-order("000001.XSHE", 100)
-order_target_value("510300.XSHG", 100000)
+order_target_value(code, value)
 ```
 
 改成：
 
 ```python
-bt.order("000001.XSHE", 100)
-bt.order_target_value("510300.XSHG", 100000)
+my_order_target_value(context, code, value)
 ```
 
-#### 5. 第一次联调时怎么改最稳
+其他下单、撤单也要按同样方式修改。策略用资金和持仓判断仓位时，模拟盘分支要读 `bt.get_account()`、`bt.get_positions()`，不能继续拿聚宽虚拟账户的数据决定 QMT 下单金额。具体字段和其他接口见[方案 1 参考](joinquant-helper-explicit.md)。如果这些地方很多，可以考虑方案 2。
 
-不要一上来就把整个复杂策略全量改掉。  
-更稳的顺序是：
+### 方案 2：接管聚宽原函数，少改策略
 
-1. 先只加 `import bullet_trade_jq_remote_helper as bt`
-2. 再加 `process_initialize` 里的 `bt.configure(...)`
-3. 先用 `bt.get_account()`、`bt.get_positions()` 验证连通
-4. 最后只替换一两个下单函数做最小测试
+常见股票、ETF 多头策略可以保留 `order()`、`order_target_value()` 和 `context.portfolio` 写法。接管层会自动识别回测和模拟盘。
 
-## 第八章：先用最小策略测试，再切回正式策略
-
-建议不要第一枪就直接改你最复杂的正式策略。  
-先在聚宽里做一个最小联通测试，例如：
+在原策略的 `from jqdata import *` 等导入后添加：
 
 ```python
 import bullet_trade_jq_remote_helper as bt
 
 
 def process_initialize(context):
-    bt.configure(
-        host="your.server.ip",
+    """根据聚宽 context 安装接管并输出状态；回测不接管，无返回值。"""
+    state = bt.install_jq_compat(
+        globals(),
+        context=context,
+        host="你的服务器地址",
         port=58620,
-        token="secret",
+        token="你的QMT_SERVER_TOKEN",
     )
-
-
-def initialize(context):
-    set_benchmark("000300.XSHG")
-    run_daily(test_remote_trade, time="09:35")
-
-
-def test_remote_trade(context):
-    acct = bt.get_account()
-    positions = bt.get_positions()
-    log.info(f"[账号] 现金={acct.available_cash:.2f} 总资产={acct.total_value:.2f}")
-    log.info(f"[持仓数] {len(positions)}")
-
-    # 第一次联调时，建议先只查账户与持仓
-    # 确认通了以后，再把下面这行打开做小额测试
-    # bt.order("000001.XSHE", 100, price=None, wait_timeout=10)
+    log.info("接管状态: %s" % state)
 ```
 
-第一轮联调，建议顺序一定要这样：
+填好连接信息后，常见的原下单语句不用加 `bt.`。回测仍走聚宽；模拟盘接管成功时，日志中会有 `'enabled': True`。
 
-1. 先 `bt.get_account()`
-2. 再 `bt.get_positions()`
-3. 最后才 `bt.order(...)`
+**此方案已有离线测试，真实聚宽到 QMT 的完整验证仍待完成，先在仿真账号验证。** 特殊交易类型、跨文件下单等是否支持，见[方案 2 兼容范围](joinquant-live-takeover-usage.md)。另外直接写出的 `bt.order()` 不受接管层的回测判断保护，不要混用。
 
-不要第一枪就直接下单。
+### 两种方案都注意这一点
 
-## 第九章：在聚宽模拟环境运行策略
+如果原策略**已经有 `process_initialize()`**，把所选方案的函数内容合并进去，不要再定义第二个同名函数。原来的 `initialize()`、`run_daily()`、选股逻辑保留，不用删除。
 
-当你已经在聚宽研究 / Jupyter 里验证通过，再把同样的改法带回聚宽模拟环境。
+## 5. 在聚宽启动模拟盘，看 QMT 是否收到订单
 
-这时候你的重点是同时观察两个地方：
+确认连接的是 **QMT 仿真账号**，启动修改后的聚宽策略，等待它原定的交易时间。不要同时运行多个相同策略副本。
 
-- 聚宽模拟日志
-- Windows 上的 `bullet-trade server` 日志
+看三个地方：
 
-至少要满足下面这些条件，才算这条路线已经跑通：
+1. 聚宽日志：策略是否正常运行、产生下单动作。
+2. QMT 委托列表：证券、方向、数量是否正确。
+3. 如有成交，QMT 成交列表、资金和持仓变化是否一致。
 
-- 聚宽研究 / Jupyter 里能完成最小远程调试
-- 聚宽模拟里能正常执行 helper
-- 能查到账户和持仓
-- 能发出一笔测试单
-- Windows 端能看到 server 收到请求并转发给 QMT
-- QMT 侧能看到对应委托
+返回订单号不等于成交；超时后先查 QMT 委托，不要直接重复下单。方案 2 默认不往聚宽虚拟账户镜像下单，聚宽页面的持仓和收益曲线不代表 QMT 实际结果。
 
-聚宽侧日志示意：
-
-![聚宽测试日志示意](assets/joinquant_test.png)
-
-## 最小验收标准
-
-建议按下面顺序验收，不要跳步：
-
-| 阶段 | 通过标准 |
-| --- | --- |
-| Windows/QMT | QMT 已登录，`bullet-trade server` 正在监听 `58620` |
-| 网络 | 聚宽研究环境能访问 server，服务端日志能看到请求 |
-| 认证 | token 正确，不返回鉴权错误 |
-| 账户 | `bt.get_account()` 能返回真实账户资金 |
-| 持仓 | `bt.get_positions()` 能返回真实持仓 |
-| 策略修改 | 已选择策略修改方案 1 或 2，并只改必要下单/账户入口 |
-| 测试单 | 小金额或仿真测试单能在 QMT 侧看到委托 |
-
-## 常见报错与排查
-
-### 1. 简单策略能买卖，复杂策略没有信号
-
-优先排查这 5 件事：
-
-1. 复杂策略的选股链路是不是根本没有迁移完整
-2. 是否依赖财务面、平台权限数据或聚宽侧研究环境
-3. 执行侧查询到的行情口径是否与你策略判断时使用的口径不同
-4. 调度时间是不是变了，导致条件判断时点不对
-5. 当天是否本来就没有满足条件的信号
-
-建议做法：
-
-- 先打印候选股票池
-- 再打印每个过滤条件剩下多少标的
-- 再打印最终买卖条件是否成立
-
-不要只盯着“为什么没有下单”，更要看“为什么没有信号”。
-
-### 2. 聚宽连不上本地或云端 server
-
-优先排查：
-
-- `host` 和 `port` 是否写对
-- `QMT_SERVER_TOKEN` 是否一致
-- 服务端是否真的监听在 `0.0.0.0`
-- Windows 防火墙是否放行
-- 云服务器安全组是否放行端口
-
-### 3. 能查持仓，但下单失败
-
-优先排查：
-
-- QMT 是否已登录
-- 账户是否可交易
-- 标的是否停牌或不在交易时段
-- 可用资金或可卖数量是否不足
-- 价格保护或最小委托单位是否触发限制
+本文默认使用整个 QMT 账户，已有持仓也会被策略读到。先完成仿真验证，再决定是否连接实盘。

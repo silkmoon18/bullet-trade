@@ -85,6 +85,7 @@ class BrokerBase(ABC):
         remark: Optional[str] = None,
         *,
         market: bool = False,
+        extra: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
         买入
@@ -96,6 +97,7 @@ class BrokerBase(ABC):
             wait_timeout: 本次下单等待超时（秒），None 表示使用默认配置
             remark: 订单备注（可选）
             market: 是否按市价委托（由券商映射到对应价格类型）
+            extra: 订单扩展字段（可选），用于远程网关透传审计信息
             
         Returns:
             订单ID
@@ -112,6 +114,7 @@ class BrokerBase(ABC):
         remark: Optional[str] = None,
         *,
         market: bool = False,
+        extra: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
         卖出
@@ -123,6 +126,7 @@ class BrokerBase(ABC):
             wait_timeout: 本次下单等待超时（秒），None 表示使用默认配置
             remark: 订单备注（可选）
             market: 是否按市价委托（由券商映射到对应价格类型）
+            extra: 订单扩展字段（可选），用于远程网关透传审计信息
             
         Returns:
             订单ID
@@ -207,6 +211,21 @@ class BrokerBase(ABC):
             是否已连接
         """
         return self._connected
+
+    def preflight(self) -> None:
+        """在策略初始化前执行无业务写入的本地前置检查。
+
+        Returns:
+            None。默认实现不做检查，保持既有券商兼容。
+
+        Raises:
+            RuntimeError: 子类可在平台、依赖或本地制品未就绪时抛出稳定错误。
+
+        Side Effects:
+            默认实现无副作用；子类不得在此连接柜台、启动监听、编译或发起交易。
+        """
+
+        return None
     
     def run_strategy(self, strategy_file: str, **kwargs):
         """

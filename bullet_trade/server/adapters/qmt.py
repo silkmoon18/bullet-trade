@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
 from functools import partial
 from typing import Any, Dict, List, Optional, Set
 
@@ -30,15 +29,16 @@ from bullet_trade.server.strategy.broker_history import (
 )
 from bullet_trade.utils.env_loader import get_data_provider_config
 
-from ..config import AccountConfig, ServerConfig
+from ..config import ServerConfig
+from . import register_adapter
 from .base import (
     AccountContext,
     AccountRouter,
     AdapterBundle,
     RemoteBrokerAdapter,
     RemoteDataAdapter,
+    mark_broker_call_started,
 )
-from . import register_adapter
 
 # 专用线程池：用于执行 xtquant 的同步调用
 # max_workers 设置较大，避免长时间阻塞的调用占满线程池
@@ -346,8 +346,8 @@ class QmtDataAdapter(RemoteDataAdapter):
         :param payload: 包含 security, count, start, end, frequency, fq, fields 等参数
         :return: DataFrame 转换后的 payload 字典
         """
-        import traceback
         import logging
+        import traceback
 
         logger = logging.getLogger(__name__)
 
@@ -411,8 +411,8 @@ class QmtDataAdapter(RemoteDataAdapter):
         :param payload: 包含 security 参数
         :return: tick 数据字典
         """
-        import traceback
         import logging
+        import traceback
 
         logger = logging.getLogger(__name__)
 
@@ -532,6 +532,8 @@ class QmtBrokerAdapter(RemoteBrokerAdapter):
     - 市价单保护价计算
     - 卖出时可卖数量检查
     """
+
+    tracks_broker_call_boundary = True
 
     def __init__(
         self,
@@ -830,7 +832,54 @@ class QmtBrokerAdapter(RemoteBrokerAdapter):
             else:
                 connected = bool(is_connected)
             accounts[key] = {"connected": connected}
-        snapshot["accounts"] = accounts
+        all_accounts_connected = bool(accounts) and all(
+            item["connected"] for item in accounts.values()
+        )
+        broker_ready = bool(self.guard.ready and all_accounts_connected)
+        reason = None
+        if not self.guard.ready:
+            reason = self.guard.last_error or f"qmt_guard_{self.guard.state}"
+        elif not all_accounts_connected:
+            reason = "one_or_more_qmt_accounts_disconnected"
+        broker_status = {"status": "ready" if broker_ready else "unavailable"}
+        if reason:
+            broker_status["reason"] = reason
+        actions = {
+            action: dict(broker_status)
+            for action in (
+                "broker.account",
+                "broker.positions",
+                "broker.orders",
+                "broker.trades",
+                "broker.order_status",
+                "broker.place_order",
+                "broker.cancel_order",
+            )
+        }
+        if self.config.enable_data:
+            data_status = {
+                "status": "ready" if self.guard.ready else "unavailable",
+            }
+            if not self.guard.ready:
+                data_status["reason"] = reason
+            for action in (
+                "data.history",
+                "data.snapshot",
+                "data.current_tick",
+                "data.trade_days",
+                "data.security_info",
+            ):
+                actions[action] = dict(data_status)
+        snapshot.update(
+            {
+                "backend_type": "qmt",
+                "ready": broker_ready,
+                "state": "ready" if broker_ready else "unavailable",
+                "reason": reason,
+                "accounts": accounts,
+                "actions": actions,
+            }
+        )
         return snapshot
 
     def _broker_for(self, ctx: AccountContext) -> QmtBroker:
@@ -976,6 +1025,7 @@ class QmtBrokerAdapter(RemoteBrokerAdapter):
         5. 卖出时可卖数量检查
         """
         import logging
+
         from bullet_trade.core import pricing
         from bullet_trade.utils.env_loader import get_live_trade_config
 
@@ -1112,6 +1162,7 @@ class QmtBrokerAdapter(RemoteBrokerAdapter):
             f"执行下单: {security} {'买入' if is_buy else '卖出'} {amount} 股，价格={price:.4f}，市价单={is_market}"
         )
 
+        mark_broker_call_started(payload)
         if is_buy:
             order = await broker.buy(
                 security,
@@ -1289,10 +1340,32 @@ def _normalise_price_multiindex_columns(columns: pd.MultiIndex) -> pd.MultiIndex
 
 
 def dataframe_to_payload(df):
+    """把 pandas DataFrame 转换为可逆的远程传输载荷。
+
+    Args:
+        df: 待编码的 DataFrame；为 ``None`` 时返回空表载荷。
+
+    Returns:
+        Dict[str, Any]: 包含列、记录以及可选索引元数据的 JSON 兼容字典。
+
+    Notes:
+        默认 ``RangeIndex(0, len(df), 1)`` 不进入 wire，避免普通行号被客户端
+        误判为交易时间；其他索引必须连同显式列名和类型元数据一起传输。
+    """
+
     if df is None:
         return {"dtype": "dataframe", "columns": [], "records": []}
 
     def _coerce_value(value):
+        """把 pandas、datetime 和 numpy 标量转换为 JSON 兼容值。
+
+        Args:
+            value: 单个 DataFrame、列或索引值。
+
+        Returns:
+            Any: 可由 JSON 编码器处理的普通 Python 值。
+        """
+
         if value is None:
             return None
         try:
@@ -1305,7 +1378,8 @@ def dataframe_to_payload(df):
         except Exception:
             pass
         try:
-            from datetime import datetime, date as Date
+            from datetime import date as Date
+            from datetime import datetime
 
             if isinstance(value, (datetime, Date)):
                 return value.isoformat()
@@ -1319,26 +1393,71 @@ def dataframe_to_payload(df):
         return value
 
     metadata: Dict[str, Any] = {}
-    try:
-        if isinstance(getattr(df, "columns", None), pd.MultiIndex):
-            df = df.copy()
-            df.columns = _normalise_price_multiindex_columns(df.columns)
-            metadata["column_tuples"] = [
-                [_coerce_value(item) for item in col] for col in df.columns.tolist()
+    if isinstance(getattr(df, "columns", None), pd.MultiIndex):
+        df = df.copy()
+        df.columns = _normalise_price_multiindex_columns(df.columns)
+        metadata["column_tuples"] = [
+            [_coerce_value(item) for item in col] for col in df.columns.tolist()
+        ]
+        metadata["column_index_names"] = [_coerce_value(name) for name in (df.columns.names or [])]
+
+    data_columns = [str(column) for column in list(getattr(df, "columns", []))]
+    index = getattr(df, "index", None)
+    is_default_range = (
+        isinstance(index, pd.RangeIndex)
+        and index.start == 0
+        and index.stop == len(df)
+        and index.step == 1
+        and index.name is None
+    )
+    include_index = index is not None and not is_default_range
+    index_columns: List[str] = []
+    index_rows: List[List[Any]] = [[] for _ in range(len(df))]
+    if include_index:
+        index_names = list(index.names) if isinstance(index, pd.MultiIndex) else [index.name]
+        occupied_columns = set(data_columns)
+        for level, raw_name in enumerate(index_names):
+            preferred = str(raw_name or ("index" if len(index_names) == 1 else f"level_{level}"))
+            wire_name = preferred
+            suffix = 0
+            while not wire_name or wire_name in occupied_columns:
+                suffix += 1
+                wire_name = f"__bt_index_{level}_{suffix}__"
+            occupied_columns.add(wire_name)
+            index_columns.append(wire_name)
+
+        if isinstance(index, pd.MultiIndex):
+            index_rows = [
+                [index.get_level_values(level)[row] for level in range(index.nlevels)]
+                for row in range(len(index))
             ]
-            metadata["column_index_names"] = [
-                _coerce_value(name) for name in (df.columns.names or [])
+            index_dtypes = [
+                str(index.get_level_values(level).dtype) for level in range(index.nlevels)
             ]
-        columns = list(df.columns)
-        raw = df.reset_index().values.tolist() if df.index.name else df.values.tolist()
-        records = [[_coerce_value(v) for v in row] for row in raw]
-    except Exception:
-        columns = getattr(df, "columns", [])
-        raw = getattr(df, "values", [])
-        records = [[_coerce_value(v) for v in row] for row in raw]
+        else:
+            index_rows = [[value] for value in index.tolist()]
+            index_dtypes = [str(index.dtype)]
+        metadata.update(
+            {
+                "index_columns": index_columns,
+                "index_names": [_coerce_value(name) for name in index_names],
+                "index_type": type(index).__name__,
+                "index_dtypes": index_dtypes,
+            }
+        )
+        if isinstance(index, pd.RangeIndex):
+            metadata["index_range"] = {
+                "start": int(index.start),
+                "stop": int(index.stop),
+                "step": int(index.step),
+            }
+
+    data_rows = getattr(df, "values", []).tolist()
+    raw = [index_row + list(data_row) for index_row, data_row in zip(index_rows, data_rows)]
+    records = [[_coerce_value(value) for value in row] for row in raw]
     payload = {
         "dtype": "dataframe",
-        "columns": [str(col) for col in columns],
+        "columns": index_columns + data_columns,
         "records": records,
     }
     payload.update(metadata)

@@ -303,6 +303,7 @@ class BacktestEngine:
         from .api import get_open_orders as _get_open_orders
         from .api import get_orders as _get_orders
         from .api import get_trades as _get_trades
+        from .api import require_data_capabilities as _require_data_capabilities
         from .api import subscribe as _subscribe
         from .api import unsubscribe as _unsubscribe
         from .api import unsubscribe_all as _unsubscribe_all
@@ -371,6 +372,7 @@ class BacktestEngine:
         module.unsubscribe = _unsubscribe
         module.unsubscribe_all = _unsubscribe_all
         module.get_current_tick = _get_current_tick
+        module.require_data_capabilities = _require_data_capabilities
 
         # 注入订单函数
         module.order = order
@@ -382,6 +384,8 @@ class BacktestEngine:
         module.get_open_orders = _get_open_orders
         module.get_orders = _get_orders
         module.get_trades = _get_trades
+        module.cancel_order = cancel_order
+        module.cancel_all_orders = cancel_all_orders
 
         # 注入调度函数
         module.run_daily = run_daily
@@ -1766,7 +1770,7 @@ class BacktestEngine:
 
             # 直接调用 provider 的 get_price，绕过 api 层的 avoid_future_data 检查
             # 这是因为停牌判断是元数据，不应受回测模式限制
-            provider = data_api._provider
+            provider = data_api.get_data_provider()
 
             # 获取 check_date 前后的数据
             start = check_date - timedelta(days=5)

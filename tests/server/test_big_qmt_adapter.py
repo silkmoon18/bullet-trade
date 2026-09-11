@@ -1,4 +1,6 @@
 import asyncio
+import time
+from pathlib import Path
 
 import pytest
 
@@ -6,23 +8,124 @@ from bullet_trade.server.adapters import get_adapter
 from bullet_trade.server.adapters.base import AccountRouter, AdapterBundle
 from bullet_trade.server.adapters.big_qmt import (
     BigQmtBrokerAdapter,
+    BigQmtGatewayClient,
     BigQmtDataAdapter,
     BigQmtGatewayConfig,
     BigQmtGatewayError,
+    _normalize_position,
+    _normalize_trade,
     build_big_qmt_bundle,
 )
 from bullet_trade.server.app import ServerApplication
 from bullet_trade.server.config import AccountConfig, ServerConfig
 
 
+def test_big_qmt_server_env_example_keeps_only_required_first_run_values():
+    """检查大 QMT 入门模板只保留三个必填项；输入为空，返回值为空。"""
+    path = Path(__file__).resolve().parents[2] / "env.bigqmt.example"
+    values = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip()
+
+    assert set(values) == {
+        "QMT_SERVER_TOKEN",
+        "QMT_ACCOUNT_ID",
+        "BIG_QMT_GATEWAY_PASSWORD",
+    }
+
+
+def test_big_qmt_helper_enables_normal_trading_and_order_cancel_by_default():
+    """检查普通下单和按订单号撤单默认开启；输入为空，返回值为空。"""
+    path = Path(__file__).resolve().parents[2] / "helpers/big_qmt_gateway_strategy_sample.py"
+    source = path.read_text(encoding="gbk")
+
+    assert "ENABLE_TRADING = True" in source
+    assert "ENABLE_CANCEL_ORDER = True" in source
+
+
+def test_big_qmt_gateway_error_preserves_broker_called_false() -> None:
+    """Gateway 明确未调用 passorder 时必须把该事实保留在异常中。
+
+    Returns:
+        None: 断言 Server 会话可继续把未提交事实传给 V2 客户端。
+    """
+
+    client = BigQmtGatewayClient(BigQmtGatewayConfig())
+
+    with pytest.raises(BigQmtGatewayError) as raised:
+        client._unwrap_response(
+            {
+                "ok": False,
+                "code": "LOCAL_REJECTED",
+                "message": "rejected before passorder",
+                "broker_called": False,
+            }
+        )
+
+    assert raised.value.code == "LOCAL_REJECTED"
+    assert raised.value.broker_called is False
+
+
+def test_big_qmt_gateway_stable_pre_passorder_error_implies_not_called() -> None:
+    """旧 helper 未回传边界字段时，稳定调用前错误码仍必须安全释放。
+
+    Returns:
+        None: 断言 QMT_NOT_READY 被解释为尚未调用 passorder。
+    """
+
+    client = BigQmtGatewayClient(BigQmtGatewayConfig())
+
+    with pytest.raises(BigQmtGatewayError) as raised:
+        client._unwrap_response(
+            {
+                "ok": False,
+                "code": "QMT_NOT_READY",
+                "message": "ContextInfo is required before trading",
+            }
+        )
+
+    assert raised.value.broker_called is False
+
+
+def test_big_qmt_trade_promotes_native_trade_datetime() -> None:
+    """真机成交日期和时间必须进入统一成交时间字段。
+
+    Returns:
+        None: 三个公共时间别名均保留真实成交时刻时通过。
+    """
+
+    trade = _normalize_trade(
+        {
+            "trade_id": "trade-9968",
+            "order_id": "9968",
+            "raw": {
+                "m_strTradeDate": "20260902",
+                "m_strTradeTime": "140101",
+            },
+        }
+    )
+
+    expected = "2026-09-02 14:01:01"
+    assert trade["trade_time"] == expected
+    assert trade["traded_time"] == expected
+    assert trade["time"] == expected
+
+
 class _FakeGatewayClient:
     def __init__(self, responses, config=None):
         self.responses = responses
         self.calls = []
+        self.timeouts = []
         self.config = config or BigQmtGatewayConfig()
+        self.last_health = None
 
-    async def post(self, path, payload=None):
+    async def post(self, path, payload=None, *, timeout_seconds=None):
         self.calls.append(("POST", path, payload or {}))
+        self.timeouts.append((path, timeout_seconds))
         value = self.responses[path]
         if isinstance(value, Exception):
             raise value
@@ -37,13 +140,21 @@ class _FakeGatewayClient:
         raise BigQmtGatewayError("missing", code="NOT_IMPLEMENTED")
 
     async def health(self):
-        return self.responses.get("/health", {"ready": True})
+        self.calls.append(("GET", "/health", {}))
+        value = self.responses.get("/health", {"ready": True})
+        if isinstance(value, Exception):
+            raise value
+        self.last_health = value
+        return value
 
     def qmt_status(self):
+        health = self.last_health or {}
+        ready = health.get("ready")
         return {
             "backend_type": "big_qmt",
-            "ready": True,
-            "big_qmt_gateway": {"ready": True},
+            "ready": ready,
+            "state": "ready" if ready else "unknown",
+            "big_qmt_gateway": health,
             "actions": self.config.action_status,
         }
 
@@ -80,14 +191,88 @@ def test_big_qmt_adapter_is_registered_and_health_reports_backend(monkeypatch):
     assert health["qmt"]["actions"]["data.subscribe"]["status"] == "degraded"
     assert health["qmt"]["actions"]["broker.place_order"]["status"] == "ready"
     assert health["qmt"]["actions"]["broker.cancel_order"]["status"] == "ready"
+    assert health["idempotency"]["mode"] == "process_memory"
+    assert health["idempotency"]["cross_restart_exactly_once"] is False
+
+
+def test_big_qmt_health_cache_expires_instead_of_staying_green(monkeypatch):
+    """验证 sidecar health 缓存过期后状态变为 unknown，而不是继续假绿。
+
+    Args:
+        monkeypatch: pytest 时间替换工具。
+
+    Returns:
+        None。
+    """
+
+    from bullet_trade.server.adapters.big_qmt import BigQmtGatewayClient
+
+    client = BigQmtGatewayClient(BigQmtGatewayConfig(health_ttl_seconds=15.0))
+    client._last_health = {"ready": True}
+    client._last_health_at = 100.0
+    monkeypatch.setattr(time, "time", lambda: 116.0)
+
+    status = client.qmt_status()
+
+    assert status["ready"] is None
+    assert status["state"] == "unknown"
+    assert status["health_cache_expired"] is True
+
+
+@pytest.mark.asyncio
+async def test_admin_health_refreshes_big_qmt_gateway_before_snapshot():
+    """验证 admin.health 返回前主动刷新 helper，而不是永久读取启动缓存。
+
+    Returns:
+        None: 断言实时 health 已进入 sidecar 快照，且只发起一次只读刷新。
+    """
+
+    client = _FakeGatewayClient(
+        {
+            "/health": {
+                "ready": True,
+                "http_alive": True,
+                "qmt_api_ready": True,
+                "direct_dispatch": True,
+            }
+        }
+    )
+    config = _server_config()
+    router = AccountRouter(config.accounts)
+    broker = BigQmtBrokerAdapter(config, router, client)
+    data = BigQmtDataAdapter(client)
+    app = ServerApplication(
+        config,
+        router,
+        AdapterBundle(data_adapter=data, broker_adapter=broker),
+    )
+
+    health = await app.handle_request(None, "admin.health", {})
+
+    assert client.calls == [("GET", "/health", {})]
+    assert health["value"]["qmt"]["ready"] is True
+    assert health["value"]["qmt"]["state"] == "ready"
+    assert health["value"]["big_qmt_gateway"]["qmt_api_ready"] is True
 
 
 @pytest.mark.asyncio
 async def test_big_qmt_data_adapter_normalizes_gateway_payloads():
+    """验证非本次指数历史和其他行情接口包装；无参数或外部副作用，返回断言结果。"""
+
+    def security_info(payload):
+        """按测试证券提供明确类型；输入查询参数，返回独立元数据，不访问真实服务。"""
+        if payload.get("security") == "000905.XSHG":
+            return {"display_name": "中证500", "type": "index"}
+        return {"display_name": "平安银行", "type": "stock"}
+
     client = _FakeGatewayClient(
         {
             "/data/history": {"records": [{"open": 1.0, "close": 2.0}]},
-            "/data/snapshot": {"ticks": {"000001.XSHE": {"lastPrice": 12.3, "time": 1783043331000, "bidPrice": [12.2]}}},
+            "/data/snapshot": {
+                "ticks": {
+                    "000001.XSHE": {"lastPrice": 12.3, "time": 1783043331000, "bidPrice": [12.2]}
+                }
+            },
             "/data/live_current": {
                 "ticks": {
                     "000001.XSHE": {
@@ -96,12 +281,20 @@ async def test_big_qmt_data_adapter_normalizes_gateway_payloads():
                         "low_limit": 11.25,
                         "openInt": 13,
                         "bidPrice": [12.4],
+                        "askPrice": [12.6],
+                        "source": "big_qmt_full_tick",
+                        "source_time": "2026-07-03T09:30:00+08:00",
+                        "received_time": "2026-07-03T09:30:01+08:00",
+                        "query_completed_time": "2026-07-03T09:30:01+08:00",
+                        "feed_health": {"status": "healthy", "query_succeeded": True},
                     }
                 }
             },
-            "/data/current_tick": {"ticks": {"000001.XSHE": {"lastPrice": 12.4, "timetag": "20260703 09:30:00"}}},
+            "/data/current_tick": {
+                "ticks": {"000001.XSHE": {"lastPrice": 12.4, "timetag": "20260703 09:30:00"}}
+            },
             "/data/trade_days": {"values": ["20260701"]},
-            "/data/security_info": {"display_name": "平安银行", "type": "stock"},
+            "/data/security_info": security_info,
             "/data/ensure_cache": {"requested": True, "security": "000001.XSHE"},
             "/data/all_securities": {"records": [{"security": "000001.XSHE", "sector": "沪深A股"}]},
             "/data/index_stocks": {"stocks": ["000001.XSHE", "000002.XSHE"]},
@@ -110,26 +303,31 @@ async def test_big_qmt_data_adapter_normalizes_gateway_payloads():
     )
     adapter = BigQmtDataAdapter(client)
 
-    history = await adapter.get_history({"security": "000001.XSHE"})
+    # 股票/ETF标准化由独立全链路测试覆盖；这里保留指数旧包装与超时契约。
+    history = await adapter.get_history({"security": "000905.XSHG"})
     assert history["dtype"] == "dataframe"
     assert history["columns"] == ["open", "close"]
     assert history["records"] == [[1.0, 2.0]]
+    assert client.timeouts[-1] == ("/data/history", 120.0)
 
     snapshot = await adapter.get_snapshot({"security": "000001.XSHE"})
-    assert snapshot == {
-        "sid": "000001.XSHE",
-        "last_price": 12.3,
-        "dt": 1783043331000,
-        "bidPrice": [12.2],
-    }
+    assert snapshot["sid"] == "000001.XSHE"
+    assert snapshot["last_price"] == 12.3
+    assert snapshot["dt"] == 1783043331000
+    assert snapshot["bidPrice"] == [12.2]
 
     live_current = await adapter.get_live_current({"security": "000001.XSHE"})
-    assert live_current == {
-        "last_price": 12.5,
-        "high_limit": 13.75,
-        "low_limit": 11.25,
-        "paused": False,
-    }
+    assert live_current["last_price"] == 12.5
+    assert live_current["high_limit"] == 13.75
+    assert live_current["low_limit"] == 11.25
+    assert live_current["paused"] is False
+    assert live_current["security"] == "000001.XSHE"
+    assert live_current["source"] == "big_qmt_full_tick"
+    assert live_current["source_time"] == "2026-07-03T09:30:00+08:00"
+    assert live_current["query_completed_time"] == "2026-07-03T09:30:01+08:00"
+    assert live_current["feed_health"]["status"] == "healthy"
+    assert live_current["bid_price1"] == pytest.approx(12.4)
+    assert live_current["ask_price1"] == pytest.approx(12.6)
 
     current_tick = await adapter.get_current_tick("000001.XSHE")
     assert current_tick == {
@@ -164,13 +362,17 @@ async def test_big_qmt_data_adapter_normalizes_gateway_payloads():
 async def test_server_dispatches_data_current_tick_with_payload():
     client = _FakeGatewayClient(
         {
-            "/data/snapshot": {"ticks": {"000001.XSHE": {"lastPrice": 12.3, "time": 1783043331000}}},
+            "/data/snapshot": {
+                "ticks": {"000001.XSHE": {"lastPrice": 12.3, "time": 1783043331000}}
+            },
         }
     )
     config = _server_config(enable_broker=False)
     router = AccountRouter(config.accounts)
     adapter = BigQmtDataAdapter(client)
-    app = ServerApplication(config, router, AdapterBundle(data_adapter=adapter, broker_adapter=None))
+    app = ServerApplication(
+        config, router, AdapterBundle(data_adapter=adapter, broker_adapter=None)
+    )
 
     current_tick = await app._dispatch_data("current_tick", {"security": "000001.XSHE"})
 
@@ -220,7 +422,10 @@ async def test_big_qmt_broker_adapter_normalizes_account_positions_orders_trades
                         "m_strExchangeID": "SH",
                         "m_nVolume": 1000,
                         "m_nCanUseVolume": 800,
-                        "m_dOpenPrice": 2.5,
+                        "m_dAvgOpenPrice": 2.5,
+                        "m_dOpenPrice": -10.0,
+                        "m_dLastPrice": 2.6,
+                        "m_dMarketValue": 2600.0,
                     }
                 ]
             },
@@ -271,6 +476,10 @@ async def test_big_qmt_broker_adapter_normalizes_account_positions_orders_trades
     assert positions[0]["security"] == "510050.XSHG"
     assert positions[0]["amount"] == 1000
     assert positions[0]["closeable_amount"] == 800
+    assert positions[0]["avg_cost"] == 2.5
+    assert positions[0]["cost_basis"] == 2.5
+    assert positions[0]["current_price"] == 2.6
+    assert positions[0]["market_value"] == 2600.0
 
     orders = await adapter.list_orders(ctx, {"order_id": "O1"})
     assert orders[0]["status"] == "filled"
@@ -302,10 +511,12 @@ async def test_big_qmt_trading_and_cancel_forward_by_default():
     ctx = router.get("default")
     adapter = BigQmtBrokerAdapter(config, router, client)
 
-    order = await adapter.place_order(ctx, {"security": "000001.XSHE", "amount": 100, "side": "BUY"})
+    order = await adapter.place_order(
+        ctx, {"security": "000001.XSHE", "amount": 100, "side": "BUY"}
+    )
     cancel = await adapter.cancel_order(ctx, "O-default")
 
-    assert order["order_id"] == "O-default"
+    assert order["status"] == "submit_unknown"
     assert cancel["value"]["success"] is True
     assert client.calls[0][1] == "/place_order"
     assert client.calls[1][1] == "/cancel_order"
@@ -336,7 +547,7 @@ async def test_big_qmt_trading_and_cancel_forward_account_payload_when_enabled()
     )
     cancel = await adapter.cancel_order(ctx, "O2")
 
-    assert order["status"] == "open"
+    assert order["status"] == "submit_unknown"
     assert cancel["value"]["value"] is True
     assert client.calls[0][1] == "/place_order"
     assert client.calls[0][2]["account_id"] == "demo"
@@ -347,10 +558,87 @@ async def test_big_qmt_trading_and_cancel_forward_account_payload_when_enabled()
 
 
 @pytest.mark.asyncio
+async def test_big_qmt_server_account_identity_cannot_be_overridden_by_client_payload():
+    """验证客户端 payload 不能覆盖 sidecar 已解析的实体账号身份。
+
+    Returns:
+        None。
+    """
+
+    client = _FakeGatewayClient(
+        {
+            "/place_order": {"order_id": "O-authoritative", "m_nOrderStatus": 50},
+            "/orders": {"orders": []},
+            "/trades": {"trades": []},
+        },
+    )
+    config = _server_config()
+    router = AccountRouter(config.accounts)
+    ctx = router.get("default")
+    adapter = BigQmtBrokerAdapter(config, router, client)
+
+    await adapter.place_order(
+        ctx,
+        {
+            "security": "000001.XSHE",
+            "amount": 100,
+            "side": "BUY",
+            "account_key": "spoofed",
+            "account_id": "spoofed-account",
+            "account_type": "spoofed-type",
+        },
+    )
+
+    submitted = client.calls[0][2]
+    assert submitted["account_key"] == "default"
+    assert submitted["account_id"] == "demo"
+    assert submitted["account_type"] == "stock"
+
+    spoofed_filters = {
+        "account_key": "spoofed",
+        "account_id": "spoofed-account",
+        "account_type": "spoofed-type",
+    }
+    await adapter.list_orders(ctx, spoofed_filters)
+    await adapter.list_trades(ctx, spoofed_filters)
+    for _, _, query in client.calls[1:]:
+        assert query["account_key"] == "default"
+        assert query["account_id"] == "demo"
+        assert query["account_type"] == "stock"
+
+
+def test_big_qmt_position_zero_average_cost_falls_back_to_positive_open_price():
+    """验证零平均成本不遮蔽后续有效的正开仓价。
+
+    Returns:
+        None。
+    """
+
+    result = _normalize_position(
+        {
+            "security": "510050.XSHG",
+            "avg_cost": 0.0,
+            "m_dOpenPrice": 2.5,
+        }
+    )
+
+    assert result["avg_cost"] == 2.5
+    assert result["cost_basis"] == 2.5
+
+
+@pytest.mark.asyncio
 async def test_big_qmt_place_order_confirms_submission_in_adapter():
+    """验证适配器凭券商真实回显确认提交；无输入和返回值，仅操作本地模拟客户端。"""
     orders_calls = 0
+    submission_identity = {}
+
+    def _place(payload):
+        """保存券商收到的客户键；输入实际提交载荷，返回尚无订单号的原生响应。"""
+        submission_identity["value"] = payload["qmt_user_order_id"]
+        return {"order_id": "", "passorder_return": 0}
 
     def _orders(_payload):
+        """返回提交前后订单快照；输入查询载荷，返回包含真实客户键的模拟订单。"""
         nonlocal orders_calls
         orders_calls += 1
         if orders_calls == 1:
@@ -360,26 +648,21 @@ async def test_big_qmt_place_order_confirms_submission_in_adapter():
                 {
                     "order_id": "O-confirmed",
                     "security": "000001.XSHE",
+                    "side": "BUY",
                     "amount": 100,
                     "order_price": 1.0,
                     "raw_status": 50,
                     "order_remark": "sub:sub-a|bt:alpha:abcd1234",
+                    "qmt_user_order_id": submission_identity["value"],
                     "sub_account_id": "sub-a",
+                    "order_time": time.time(),
                 }
             ]
         }
 
     client = _FakeGatewayClient(
         {
-            "/place_order": {
-                "order_id": "",
-                "passorder_return": 0,
-                "security": "000001.XSHE",
-                "amount": 100,
-                "price": 1.0,
-                "order_remark": "sub:sub-a|bt:alpha:abcd1234",
-                "sub_account_id": "sub-a",
-            },
+            "/place_order": _place,
             "/orders": _orders,
         },
     )
@@ -392,8 +675,8 @@ async def test_big_qmt_place_order_confirms_submission_in_adapter():
         ctx,
         {
             "security": "000001.XSHE",
-            "amount": 100,
             "side": "BUY",
+            "amount": 100,
             "style": {"type": "limit", "price": 1.0},
             "sub_account_id": "sub-a",
             "order_remark": "bt:alpha:abcd1234",
@@ -427,6 +710,8 @@ async def test_big_qmt_place_order_skips_known_order_ids_when_confirming():
             "order_remark": "sub:sub-a|bt:old",
             "sub_account_id": "sub-a",
             "qmt_user_order_id": "BT-old",
+            "side": "BUY",
+            "order_time": time.time() - 30,
         }
         new_order = {
             "order_id": "O-new",
@@ -434,8 +719,10 @@ async def test_big_qmt_place_order_skips_known_order_ids_when_confirming():
             "amount": 100,
             "order_price": 10.0,
             "raw_status": 56,
-            "order_remark": "BT-new",
+            "order_remark": "sub:sub-a|bt:new",
             "qmt_user_order_id": "BT-new",
+            "side": "BUY",
+            "order_time": time.time(),
         }
         if orders_calls == 1:
             return {"orders": [old_order]}
@@ -470,6 +757,7 @@ async def test_big_qmt_place_order_skips_known_order_ids_when_confirming():
             "style": {"type": "limit", "price": 10.0},
             "sub_account_id": "sub-a",
             "order_remark": "bt:new",
+            "qmt_user_order_id": "BT-new",
             "wait_timeout": 0.05,
         },
     )
@@ -496,6 +784,8 @@ async def test_big_qmt_place_order_waits_for_non_empty_order_id():
             "raw_status": 50,
             "order_remark": "BT-ready",
             "qmt_user_order_id": "BT-ready",
+            "side": "BUY",
+            "order_time": time.time(),
         }
         return {"orders": [row]}
 
@@ -524,6 +814,7 @@ async def test_big_qmt_place_order_waits_for_non_empty_order_id():
             "amount": 100,
             "side": "BUY",
             "style": {"type": "limit", "price": 10.0},
+            "qmt_user_order_id": "BT-ready",
             "wait_timeout": 0.3,
         },
     )
@@ -534,7 +825,7 @@ async def test_big_qmt_place_order_waits_for_non_empty_order_id():
 
 
 @pytest.mark.asyncio
-async def test_big_qmt_place_order_matches_new_order_when_gateway_tag_is_stale():
+async def test_big_qmt_place_order_does_not_match_new_order_when_gateway_tag_is_stale():
     orders_calls = 0
 
     def _orders(_payload):
@@ -602,13 +893,8 @@ async def test_big_qmt_place_order_matches_new_order_when_gateway_tag_is_stale()
             "wait_timeout": 0.05,
         },
     )
-    filtered_orders = await adapter.list_orders(ctx, {"sub_account_id": "sim_a"})
 
-    assert order["order_id"] == "O-new"
-    assert order["sub_account_id"] == "sim_a"
-    assert order["order_remark"] == "sub:sim_a|bt:test"
-    assert filtered_orders[-1]["order_id"] == "O-new"
-    assert filtered_orders[-1]["sub_account_id"] == "sim_a"
+    assert order["status"] == "submit_unknown"
 
 
 @pytest.mark.asyncio
@@ -645,3 +931,373 @@ async def test_big_qmt_place_order_returns_submit_unknown_when_not_visible():
     assert order["timed_out"] is True
     assert order["async_tracking"] is True
     assert "no matching order" in order["warning"]
+
+
+@pytest.mark.asyncio
+async def test_big_qmt_confirmation_rejects_reverse_order_with_same_economic_fields():
+    """同标的/数量/价格的 SELL 不能确认本次 BUY，必须保持 submit_unknown。"""
+
+    calls = 0
+    submission_identity = {"value": ""}
+
+    def _place(payload):
+        submission_identity["value"] = payload["qmt_user_order_id"]
+        assert len(submission_identity["value"]) == 23
+        return {"order_id": "", "passorder_return": 0}
+
+    def _orders(_payload):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return {"orders": []}
+        return {
+            "orders": [
+                {
+                    "order_id": "reverse-sell",
+                    "security": "511880.XSHG",
+                    "side": "SELL",
+                    "amount": 100,
+                    "order_price": 100.0,
+                    "qmt_user_order_id": submission_identity["value"],
+                    "order_time": time.time(),
+                    "raw_status": 50,
+                }
+            ]
+        }
+
+    client = _FakeGatewayClient({"/place_order": _place, "/orders": _orders})
+    config = _server_config()
+    router = AccountRouter(config.accounts)
+    adapter = BigQmtBrokerAdapter(config, router, client)
+
+    order = await adapter.place_order(
+        router.get("default"),
+        {
+            "security": "511880.XSHG",
+            "side": "BUY",
+            "amount": 100,
+            "style": {"type": "limit", "price": 100.0},
+            "idempotency_key": "reverse-direction-key",
+            "wait_timeout": 0.01,
+        },
+    )
+
+    assert order["status"] == "submit_unknown"
+    assert submission_identity["value"].startswith("BT-")
+
+
+@pytest.mark.asyncio
+async def test_big_qmt_place_order_confirms_live_gateway_raw_order_shape():
+    """验证真机 raw 方向、时间和强订单标识足以确认实际订单号。
+
+    Returns:
+        None。
+    """
+
+    calls = 0
+    submission_identity = {"value": ""}
+
+    def _place(payload):
+        """记录 sidecar 实际收到的强订单标识。
+
+        Args:
+            payload: adapter 发给 BigQMT helper 的下单载荷。
+
+        Returns:
+            dict: 模拟 passorder 未同步返回订单号的响应。
+        """
+
+        submission_identity["value"] = payload["qmt_user_order_id"]
+        assert len(submission_identity["value"]) == 23
+        return {"order_id": "", "passorder_return": 0}
+
+    def _orders(_payload):
+        """先返回下单前快照，再返回真机字段形态的新订单。
+
+        Args:
+            _payload: 订单查询过滤条件，本测试不使用。
+
+        Returns:
+            dict: helper 的订单列表响应。
+        """
+
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return {"orders": []}
+        return {
+            "orders": [
+                {
+                    "order_id": "5236",
+                    "security": "511880.XSHG",
+                    "amount": 100,
+                    "filled": 100,
+                    "order_price": 110.836,
+                    "raw_status": 56,
+                    "order_remark": submission_identity["value"],
+                    "qmt_user_order_id": submission_identity["value"],
+                    "raw": {
+                        "m_nOpType": 23,
+                        "m_strInsertDate": time.strftime("%Y%m%d"),
+                        "m_strInsertTime": time.strftime("%H%M%S"),
+                        "m_strRemark": submission_identity["value"],
+                    },
+                }
+            ]
+        }
+
+    client = _FakeGatewayClient({"/place_order": _place, "/orders": _orders})
+    config = _server_config()
+    router = AccountRouter(config.accounts)
+    adapter = BigQmtBrokerAdapter(config, router, client)
+
+    order = await adapter.place_order(
+        router.get("default"),
+        {
+            "security": "511880.XSHG",
+            "side": "BUY",
+            "amount": 100,
+            "style": {"type": "market", "protect_price": 120.0},
+            "market_type": "opponent_best",
+            "order_remark": "strategy-business-remark",
+            "qmt_user_order_id": "BT-explicit-identity-that-is-too-long",
+            "idempotency_key": "live-shape-confirmation",
+            "wait_timeout": 0.05,
+        },
+    )
+
+    assert order["order_id"] == "5236"
+    assert order["status"] == "filled"
+    assert order["side"] == "BUY"
+    assert client.calls[1][2]["pr_type"] == 44
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("security", "market_type", "expected_pr_type"),
+    [
+        ("511880.XSHG", None, 44),
+        ("511880.XSHG", "opponent_best", 44),
+        ("511880.XSHG", "home_best", 45),
+        ("511880.XSHG", "five_level_ioc", 42),
+        ("511880.XSHG", "five_level_to_limit", 43),
+        ("159001.XSHE", None, 44),
+        ("159001.XSHE", "opponent_best", 44),
+        ("159001.XSHE", "home_best", 45),
+        ("159001.XSHE", "immediate_or_cancel", 46),
+        ("159001.XSHE", "five_level_ioc", 47),
+        ("159001.XSHE", "fill_or_kill", 48),
+    ],
+)
+async def test_big_qmt_maps_canonical_market_type_to_native_pr_type(
+    security, market_type, expected_pr_type
+):
+    """验证沪深公共市价类型映射为已真机验证的 BigQMT pr_type。
+
+    Args:
+        security: 带交易所后缀的证券代码。
+        market_type: 公共 canonical 市价类型。
+        expected_pr_type: BigQMT 原生价格类型。
+
+    Returns:
+        None。
+    """
+
+    client = _FakeGatewayClient({"/place_order": {"order_id": "", "passorder_return": 0}})
+    config = _server_config()
+    router = AccountRouter(config.accounts)
+    adapter = BigQmtBrokerAdapter(config, router, client)
+
+    await adapter.place_order(
+        router.get("default"),
+        {
+            "security": security,
+            "side": "BUY",
+            "amount": 100,
+            "style": {"type": "market", "protect_price": 100.0},
+            **({"market_type": market_type} if market_type else {}),
+        },
+    )
+
+    assert client.calls[0][2]["pr_type"] == expected_pr_type
+
+
+@pytest.mark.asyncio
+async def test_big_qmt_preserves_explicit_native_pr_type():
+    """验证调用方显式传入的原生 pr_type 不会被公共映射覆盖。
+
+    Returns:
+        None。
+    """
+
+    client = _FakeGatewayClient({"/place_order": {"order_id": "", "passorder_return": 0}})
+    config = _server_config()
+    router = AccountRouter(config.accounts)
+    adapter = BigQmtBrokerAdapter(config, router, client)
+
+    await adapter.place_order(
+        router.get("default"),
+        {
+            "security": "511880.XSHG",
+            "side": "BUY",
+            "amount": 100,
+            "style": {"type": "market", "protect_price": 100.0},
+            "market_type": "opponent_best",
+            "pr_type": 5,
+        },
+    )
+
+    assert client.calls[0][2]["pr_type"] == 5
+
+
+@pytest.mark.asyncio
+async def test_big_qmt_cancel_request_confirms_exact_order_terminal_status():
+    """验证撤单只发送一次，并以精确订单号的已撤状态收口。
+
+    Returns:
+        None。
+    """
+
+    client = _FakeGatewayClient(
+        {
+            "/cancel_order": {"order_id": "6128", "success": True},
+            "/order_status": {
+                "order_id": "6128",
+                "security": "511880.XSHG",
+                "raw_status": 54,
+                "amount": 100,
+                "filled": 0,
+            },
+        }
+    )
+    config = _server_config()
+    router = AccountRouter(config.accounts)
+    adapter = BigQmtBrokerAdapter(config, router, client)
+
+    result = await adapter.cancel_order_request(
+        router.get("default"),
+        {"order_id": "6128", "idempotency_key": "cancel-exact-6128"},
+    )
+
+    assert result["order_id"] == "6128"
+    assert result["status"] == "partly_canceled"
+    assert result["value"] is True
+    assert result["last_snapshot"]["raw_status"] == 54
+    assert [path for _, path, _ in client.calls].count("/cancel_order") == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("duplicate", [False, True])
+@pytest.mark.parametrize("identity_location", ["top", "raw", "remark"])
+async def test_bigqmt_virtual_market_fill_with_only_customer_identity(duplicate, identity_location):
+    """重放缺少子仓标签的市价成交；输入重复候选标记，返回空并断言唯一认领。"""
+    state = {}
+
+    def place(payload):
+        """记录实际提交身份；输入下单载荷，返回无同步订单号的原生回包。"""
+        state.update(payload)
+        return {"order_id": "", "passorder_return": 0}
+
+    def orders(payload):
+        """返回只回显客户标识的成交；输入查询参数，返回受控券商快照。"""
+        if not state:
+            return []
+        row = dict(
+            order_id="real-filled",
+            security="159967.XSHE",
+            amount=62900,
+            filled=62900,
+            status="filled",
+            side="SELL",
+            order_price=0.773,
+            order_time=time.time(),
+            qmt_user_order_id=state["qmt_user_order_id"],
+            order_remark=state["qmt_user_order_id"],
+        )
+        if identity_location != "top":
+            row.pop("qmt_user_order_id")
+        if identity_location == "raw":
+            row.pop("order_remark")
+            row["raw"] = {"m_strUserOrderId": state["qmt_user_order_id"]}
+        return [row, dict(row, order_id="ambiguous-other")] if duplicate else [row]
+
+    client = _FakeGatewayClient({"/place_order": place, "/orders": orders})
+    config = _server_config()
+    router = AccountRouter(config.accounts)
+    adapter = BigQmtBrokerAdapter(config, router, client)
+    result = await adapter.place_order(
+        router.get("default"),
+        dict(
+            security="159967.XSHE",
+            side="SELL",
+            amount=62900,
+            style={"type": "market", "price": 0.762},
+            sub_account_id="b4-test",
+            order_remark="signal:286/exec:176",
+            idempotency_key="test-b4-fill",
+            wait_timeout=0.02,
+        ),
+    )
+    assert result["status"] == ("submit_unknown" if duplicate else "filled")
+    assert len([x for x in client.calls if x[1] == "/place_order"]) == 1
+    if not duplicate:
+        assert result["sub_account_id"] == "b4-test"
+        assert await adapter.list_orders(router.get("default"), {"sub_account_id": "other"}) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "identity_case", ["missing", "conflict", "raw_conflict", "remark_conflict"]
+)
+async def test_bigqmt_confirmation_requires_unambiguous_broker_identity(identity_case):
+    """验证备注不能替代缺失或冲突的客户键；输入冲突种类，返回空并断言不重发。"""
+    state = {}
+
+    def place(payload):
+        """保存本次提交；输入请求载荷，返回尚未确认的原生下单结果。"""
+        state.update(payload)
+        return {"order_id": "", "passorder_return": 0}
+
+    def orders(payload):
+        """生成存在身份缺口的回报；输入查询载荷，返回本地模拟订单列表。"""
+        if not state:
+            return []
+        row = dict(
+            order_id="untrusted-order",
+            security="159967.XSHE",
+            side="SELL",
+            amount=62900,
+            order_price=0.773,
+            order_time=time.time(),
+            order_remark=state["order_remark"],
+            sub_account_id="b4-test",
+        )
+        if identity_case == "conflict":
+            row["qmt_user_order_id"] = "BT-another"
+        elif identity_case == "raw_conflict":
+            row["qmt_user_order_id"] = state["qmt_user_order_id"]
+            row["raw"] = {"m_strUserOrderId": "BT-another"}
+        elif identity_case == "remark_conflict":
+            row["qmt_user_order_id"] = state["qmt_user_order_id"]
+            row["remark"] = "BT-another"
+        return [row]
+
+    client = _FakeGatewayClient({"/place_order": place, "/orders": orders})
+    config = _server_config()
+    router = AccountRouter(config.accounts)
+    adapter = BigQmtBrokerAdapter(config, router, client)
+    result = await adapter.place_order(
+        router.get("default"),
+        dict(
+            security="159967.XSHE",
+            side="SELL",
+            amount=62900,
+            style={"type": "market", "price": 0.762},
+            sub_account_id="b4-test",
+            order_remark="signal:286/exec:176",
+            idempotency_key="review-identity",
+            wait_timeout=0.01,
+        ),
+    )
+    assert result["status"] == "submit_unknown"
+    assert len([call for call in client.calls if call[1] == "/place_order"]) == 1

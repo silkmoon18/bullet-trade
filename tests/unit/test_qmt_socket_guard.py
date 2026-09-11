@@ -282,6 +282,83 @@ def test_qmt_guard_default_max_delay_limits_long_outage_probe_rate(monkeypatch):
 
 
 @pytest.mark.unit
+def test_qmt_guard_constructs_after_closed_loop_and_keeps_single_flight():
+    """验证关闭旧 loop 后可同步构造 guard，且并发探针仍保持单飞。
+
+    Args:
+        None。
+
+    Returns:
+        None。
+
+    Side Effects:
+        创建并关闭两个本地 asyncio event loop，不连接真实 QMT。
+    """
+
+    async def _finish_prior_loop() -> None:
+        """让前序 asyncio.run 正常完成并关闭其 event loop。
+
+        Args:
+            None。
+
+        Returns:
+            None。
+        """
+
+        await asyncio.sleep(0)
+
+    async def _exercise_single_flight(guard: QmtAvailabilityGuard) -> None:
+        """并发申请探针并验证释放后可在新周期再次获取。
+
+        Args:
+            guard: 在旧 event loop 关闭后同步构造的保护器。
+
+        Returns:
+            None。
+        """
+
+        attempts = await asyncio.gather(*(guard.acquire_probe() for _ in range(8)))
+        assert attempts.count(True) == 1
+        assert attempts.count(False) == 7
+
+        guard.release_probe()
+        guard.schedule_probe_now("测试释放后的下一次探针")
+        assert await guard.acquire_probe() is True
+        guard.release_probe()
+
+    errors = []
+
+    def _run_guard_lifecycle() -> None:
+        """在独立线程重现 Python 3.9 的 event loop 生命周期。
+
+        Args:
+            None。
+
+        Returns:
+            None。
+
+        Side Effects:
+            在当前测试线程创建并关闭两个 event loop，异常会写入 errors。
+        """
+
+        try:
+            asyncio.run(_finish_prior_loop())
+            guard = QmtAvailabilityGuard(config=_guard_config(), name="loop-lifecycle")
+            guard.schedule_probe_now("测试同步构造后的首次探针")
+            asyncio.run(_exercise_single_flight(guard))
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=_run_guard_lifecycle, name="qmt-guard-loop-test")
+    worker.start()
+    worker.join(timeout=5)
+
+    assert worker.is_alive() is False
+    if errors:
+        raise errors[0]
+
+
+@pytest.mark.unit
 def test_qmt_broker_connect_failure_is_single_attempt_and_cleans_trader(monkeypatch):
     """验证 QMT broker 连接失败不会无限重试，并会清理本次 trader。
 
@@ -391,12 +468,13 @@ def test_qmt_broker_connect_failure_is_single_attempt_and_cleans_trader(monkeypa
 
     _install_fake_xtquant(monkeypatch, _FailingTrader)
 
-    broker = QmtBroker(account_id="demo", data_path="C:/qmt")
+    broker = QmtBroker(account_id="demo", data_path="C:/qmt", session_id=2026081101)
     with pytest.raises(RuntimeError, match="connect"):
         broker.connect()
 
     assert len(instances) == 1
     trader = instances[0]
+    assert trader.session_id == 2026081101
     assert trader.connect_calls == 1
     assert trader.unregister_calls == 1
     assert trader.disconnect_calls == 1
@@ -405,6 +483,11 @@ def test_qmt_broker_connect_failure_is_single_attempt_and_cleans_trader(monkeypa
     assert broker._xt_account is None
     assert broker._xt_callback is None
     assert broker.is_connected is False
+
+    with pytest.raises(RuntimeError, match="connect"):
+        broker.connect()
+    assert len(instances) == 2
+    assert instances[1].session_id > trader.session_id
 
 
 @pytest.mark.unit
@@ -551,6 +634,8 @@ async def test_qmt_broker_adapter_recovers_after_cooldown(monkeypatch):
         """第一次连接失败、第二次连接成功的 fake broker。"""
 
         connect_calls = 0
+        place_calls = 0
+        cancel_calls = 0
 
         def __init__(self, **kwargs):
             """接收真实 broker 初始化参数。
@@ -621,6 +706,36 @@ async def test_qmt_broker_adapter_recovers_after_cooldown(monkeypatch):
 
             return {"account_id": "demo"}
 
+        def buy(self, *args, **kwargs):
+            """记录不应由重连任务触发的下单调用。
+
+            Args:
+                *args: 模拟下单位置参数。
+                **kwargs: 模拟下单关键字参数。
+
+            Returns:
+                str: 假订单号。
+            """
+
+            _ = args, kwargs
+            type(self).place_calls += 1
+            return "unexpected-order"
+
+        def cancel_order(self, *args, **kwargs):
+            """记录不应由重连任务触发的撤单调用。
+
+            Args:
+                *args: 模拟撤单位置参数。
+                **kwargs: 模拟撤单关键字参数。
+
+            Returns:
+                bool: 固定 True。
+            """
+
+            _ = args, kwargs
+            type(self).cancel_calls += 1
+            return True
+
     async def _run_now(func, *args, **kwargs):
         """立即执行同步函数。
 
@@ -658,6 +773,8 @@ async def test_qmt_broker_adapter_recovers_after_cooldown(monkeypatch):
         await _wait_until(lambda: guard.ready and _RecoveringBroker.connect_calls >= 2)
         resp = await adapter.get_account_info(ctx)
         assert resp["value"]["account_id"] == "demo"
+        assert _RecoveringBroker.place_calls == 0
+        assert _RecoveringBroker.cancel_calls == 0
     finally:
         await adapter.stop()
 
@@ -977,6 +1094,66 @@ def test_qmt_health_reports_unavailable_without_hiding_features():
     assert health["features"] == ["data"]
     assert health["qmt"]["ready"] is False
     assert health["qmt"]["last_error"] == "QMT down"
+
+
+@pytest.mark.unit
+def test_qmt_broker_health_exposes_real_action_readiness():
+    """验证 QMT broker health 由 guard 与账户连接共同决定写能力。
+
+    Args:
+        None。
+
+    Returns:
+        None。
+    """
+
+    class _ConnectedBroker:
+        """提供可切换连接状态的最小 Broker。"""
+
+        def __init__(self) -> None:
+            """初始化为已连接状态。
+
+            Returns:
+                None。
+            """
+
+            self.is_connected = True
+
+    config = ServerConfig(
+        server_type="qmt",
+        listen="127.0.0.1",
+        port=0,
+        token="t",
+        enable_data=False,
+        enable_broker=True,
+        accounts=[AccountConfig(key="default", account_id="demo")],
+    )
+    router = AccountRouter(config.accounts)
+    guard = QmtAvailabilityGuard(config=_guard_config(), name="test")
+    adapter = QmtBrokerAdapter(config, router, guard=guard)
+    broker = _ConnectedBroker()
+    adapter._brokers["default"] = broker
+    app = ServerApplication(
+        config,
+        router,
+        AdapterBundle(data_adapter=None, broker_adapter=adapter),
+    )
+
+    ready = app._health_snapshot()["value"]
+
+    assert ready["backend_type"] == "qmt"
+    assert ready["qmt"]["ready"] is True
+    assert ready["qmt"]["actions"]["broker.orders"]["status"] == "ready"
+    assert ready["qmt"]["actions"]["broker.place_order"]["status"] == "ready"
+    assert ready["idempotency"]["mode"] == "process_memory"
+
+    broker.is_connected = False
+    unavailable = app._health_snapshot()["value"]
+
+    assert unavailable["process_alive"] is True
+    assert unavailable["qmt"]["ready"] is False
+    assert unavailable["qmt"]["reason"] == "one_or_more_qmt_accounts_disconnected"
+    assert unavailable["qmt"]["actions"]["broker.place_order"]["status"] == "unavailable"
 
 
 @pytest.mark.unit

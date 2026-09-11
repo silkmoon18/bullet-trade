@@ -40,17 +40,98 @@ def _env(key: str, default: Optional[str] = None) -> Optional[str]:
     return os.environ.get(key, default)
 
 
+def _restore_payload_index(df: pd.DataFrame, payload: Dict[str, Any]) -> pd.DataFrame:
+    """按服务端显式 metadata 恢复 DataFrame 行索引。
+
+    Args:
+        df: 已按 wire ``columns`` 和 ``records`` 构造的表。
+        payload: QMT server 返回的 dataframe payload。
+
+    Returns:
+        pd.DataFrame: 已移除 wire 索引列并恢复原索引的表。
+
+    Raises:
+        ValueError: 索引列、层数、类型或 RangeIndex 元数据不一致时抛出。
+    """
+
+    raw_columns = payload.get("index_columns") or []
+    if not raw_columns:
+        return df
+    if not isinstance(raw_columns, list) or not all(isinstance(item, str) for item in raw_columns):
+        raise ValueError("QMT dataframe index_columns 非法")
+    missing = [column for column in raw_columns if column not in df.columns]
+    if missing:
+        raise ValueError(f"QMT dataframe 缺少显式索引列: {missing}")
+
+    index_names = list(payload.get("index_names") or [])
+    if len(index_names) != len(raw_columns):
+        raise ValueError("QMT dataframe index_names 与 index_columns 层数不一致")
+    index_dtypes = list(payload.get("index_dtypes") or [])
+    if index_dtypes and len(index_dtypes) != len(raw_columns):
+        raise ValueError("QMT dataframe index_dtypes 与 index_columns 层数不一致")
+
+    arrays: List[Any] = []
+    for level, column in enumerate(raw_columns):
+        values = df.pop(column)
+        dtype = str(index_dtypes[level]) if index_dtypes else ""
+        if dtype.startswith("datetime64"):
+            values = pd.to_datetime(values, errors="raise")
+        elif dtype.startswith("timedelta64"):
+            values = pd.to_timedelta(values, errors="raise")
+        arrays.append(values)
+
+    index_type = str(payload.get("index_type") or "Index")
+    if len(arrays) == 1 and index_type == "RangeIndex":
+        range_meta = payload.get("index_range") or {}
+        candidate = pd.RangeIndex(
+            start=int(range_meta.get("start", 0)),
+            stop=int(range_meta.get("stop", 0)),
+            step=int(range_meta.get("step", 1)),
+            name=index_names[0],
+        )
+        if candidate.tolist() != arrays[0].tolist():
+            raise ValueError("QMT dataframe RangeIndex 元数据与 wire 值不一致")
+        df.index = candidate
+    elif len(arrays) == 1 and index_type == "DatetimeIndex":
+        restored_index = pd.DatetimeIndex(pd.to_datetime(arrays[0], errors="raise"))
+        restored_index.name = index_names[0]
+        df.index = restored_index
+    elif len(arrays) == 1:
+        df.index = pd.Index(arrays[0].tolist(), name=index_names[0])
+    else:
+        df.index = pd.MultiIndex.from_arrays(arrays, names=index_names)
+    return df
+
+
 def _dataframe_from_payload(payload: Dict[str, Any]) -> pd.DataFrame:
+    """把 QMT server 的 dataframe payload 无损恢复为 DataFrame。
+
+    Args:
+        payload: server 返回的 dataframe wire 字典。
+
+    Returns:
+        pd.DataFrame: 已恢复显式行索引与 MultiIndex 列的表；非 dataframe 返回空表。
+
+    Raises:
+        ValueError: wire 列数或索引/列 metadata 不一致时抛出。
+    """
+
     if not payload or payload.get("dtype") != "dataframe":
         return pd.DataFrame()
-    columns = payload.get("columns") or []
-    column_tuples = payload.get("column_tuples") or None
+    wire_columns = list(payload.get("columns") or [])
     records = payload.get("records") or []
+    df = pd.DataFrame(records, columns=wire_columns)
+    df = _restore_payload_index(df, payload)
+
+    column_tuples = payload.get("column_tuples") or None
     if column_tuples:
-        columns = _multiindex_from_payload_columns(column_tuples, payload.get("column_index_names"))
+        if len(column_tuples) != len(df.columns):
+            raise ValueError("QMT dataframe column_tuples 与数据列数不一致")
+        df.columns = _multiindex_from_payload_columns(
+            column_tuples, payload.get("column_index_names")
+        )
     else:
-        columns = _parse_legacy_tuple_columns(columns)
-    df = pd.DataFrame(records, columns=columns)
+        df.columns = _parse_legacy_tuple_columns(list(df.columns))
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = _normalise_price_multiindex_columns(df.columns)
     return df
@@ -113,11 +194,13 @@ class RemoteQmtProvider(DataProvider):
             raise RuntimeError("缺少 QMT_SERVER_TOKEN，用于鉴权远程 server")
         tls_cert = self.config.get("tls_cert") or _env("QMT_SERVER_TLS_CERT")
         tls_enabled = bool(tls_cert)
-        self._connection = RemoteQmtConnection(host, port, token, tls_cert=tls_cert, tls_enabled=tls_enabled)
+        self._connection = RemoteQmtConnection(
+            host, port, token, tls_cert=tls_cert, tls_enabled=tls_enabled
+        )
         self._connection.add_event_listener("tick", self._handle_tick_event)
         self._connection.start()
         self._subscription_key = "remote-provider"
-        self._tick_callback: Optional[Callable[[Any, Dict[str, Any]], None]] = None
+        self._tick_callback: Optional[Callable[..., None]] = None
         self._tick_context: Optional[Any] = None
 
     def get_price(
@@ -136,16 +219,29 @@ class RemoteQmtProvider(DataProvider):
         prefer_engine: bool = False,
         force_no_engine: bool = False,
     ) -> pd.DataFrame:
+        """编码历史行情请求并恢复远端结果，不在客户端复权或聚合。
 
-        def _is_minute_frequency(value: str) -> bool:
+        参数包含证券、起止时间、周期、字段、停牌/形状选项、复权方式及参考日；
+        prefer_engine 和 force_no_engine 保留兼容，不发送给远端。
+        返回远端协议恢复的 DataFrame；副作用仅为一次 data.history 请求，
+        请求或解码异常直接向上传播。分钟及原生 1h 的 datetime 保留时分秒。
+        """
+
+        def _keeps_intraday_time(value: str) -> bool:
+            """判断周期编码是否保留日内时间；输入周期，返回布尔值，无副作用。"""
             freq = str(value or "").strip().lower()
+            if freq == "1h":
+                return True
             if "minute" in freq or "min" in freq:
                 return True
             return freq.endswith("m") and freq[:-1].isdigit()
 
         def _str_format(date_obj):
+            """按请求周期编码 datetime；输入日期对象，返回字符串或原值，无副作用。"""
             if date_obj and isinstance(date_obj, datetime):
-                return date_obj.strftime("%Y-%m-%d %H:%M:%S" if _is_minute_frequency(frequency) else "%Y-%m-%d")
+                return date_obj.strftime(
+                    "%Y-%m-%d %H:%M:%S" if _keeps_intraday_time(frequency) else "%Y-%m-%d"
+                )
             return date_obj
 
         payload = {
@@ -154,8 +250,11 @@ class RemoteQmtProvider(DataProvider):
             "end": _str_format(end_date),
             "frequency": frequency,
             "fields": fields,
+            "skip_paused": skip_paused,
             "fq": fq,
             "count": count,
+            "panel": panel,
+            "fill_paused": fill_paused,
             "pre_factor_ref_date": _str_format(pre_factor_ref_date),
         }
 
@@ -192,7 +291,9 @@ class RemoteQmtProvider(DataProvider):
             securities = [security]
         return {str(sec): last_day for sec in securities}
 
-    def get_all_securities(self, types: Union[str, List[str]] = "stock", date: Optional[str] = None) -> pd.DataFrame:
+    def get_all_securities(
+        self, types: Union[str, List[str]] = "stock", date: Optional[str] = None
+    ) -> pd.DataFrame:
         payload = {"types": types, "date": date}
         resp = self._connection.request("data.get_all_securities", payload)
         return _dataframe_from_payload(resp)
@@ -230,7 +331,25 @@ class RemoteQmtProvider(DataProvider):
             if key not in {"dtype", "value"} and item is not None
         }
 
-    def set_tick_callback(self, callback: Callable[[Any, Dict[str, Any]], None], context: Any) -> None:
+    def set_tick_callback(
+        self,
+        callback: Callable[..., None],
+        context: Optional[Any] = None,
+    ) -> None:
+        """注册标准 provider tick 回调，并兼容旧版显式上下文。
+
+        Args:
+            callback: LiveEngine 使用 ``callback(tick)``；旧 Core API 可使用
+                ``callback(context, tick)``。
+            context: 旧版调用方绑定的上下文；省略时按标准单参数合同分发。
+
+        Returns:
+            None: 仅更新内存中的回调和可选上下文。
+
+        Side Effects:
+            后续远程 tick 事件会同步调用已注册回调。
+        """
+
         self._tick_callback = callback
         self._tick_context = context
 
@@ -251,7 +370,38 @@ class RemoteQmtProvider(DataProvider):
         resp = self._connection.request("data.snapshot", payload)
         return resp or {}
 
+    def get_live_current(self, security: str) -> Dict[str, Any]:
+        """通过远端实时行情合同获取目标证券的当前数据。
+
+        Args:
+            security: 标准化或兼容格式的证券代码。
+
+        Returns:
+            Dict[str, Any]: 服务端 ``data.live_current`` 返回的当前行情字段；
+            空响应规范化为空字典。
+
+        Raises:
+            Exception: 远端请求失败时原样抛出，禁止回退到弱快照语义。
+        """
+
+        payload = {"security": security}
+        resp = self._connection.request("data.live_current", payload)
+        return resp or {}
+
     def _handle_tick_event(self, payload: Dict[str, Any]) -> None:
+        """规范化远程 tick 事件并按新旧回调合同安全分发。
+
+        Args:
+            payload: 远程连接推送的原始 tick 字典。
+
+        Returns:
+            None: 无回调、缺证券代码或回调异常时静默返回。
+
+        Side Effects:
+            有显式旧版上下文时调用 ``callback(context, tick)``，否则调用
+            ``callback(tick)``。
+        """
+
         callback = self._tick_callback
         if not callback:
             return
@@ -264,7 +414,10 @@ class RemoteQmtProvider(DataProvider):
             "dt": payload.get("dt") or payload.get("time"),
         }
         try:
-            callback(self._tick_context, tick)
+            if self._tick_context is None:
+                callback(tick)
+            else:
+                callback(self._tick_context, tick)
         except Exception:
             pass
 

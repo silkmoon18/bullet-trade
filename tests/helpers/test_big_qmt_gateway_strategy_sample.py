@@ -1,9 +1,13 @@
 import importlib.util
+from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from types import SimpleNamespace
 
+import pandas as pd
 import pytest
 from tornado.httputil import HTTPHeaders
+
+from bullet_trade.data.providers.remote_qmt import _dataframe_from_payload
 
 
 TEST_ACCOUNT_ID = "test_account_id"
@@ -11,10 +15,28 @@ TEST_ACCOUNT_ID = "test_account_id"
 
 def _load_helper():
     path = Path(__file__).resolve().parents[2] / "helpers" / "big_qmt_gateway_strategy_sample.py"
-    spec = importlib.util.spec_from_file_location("bt_big_qmt_gateway_strategy_sample_for_test", str(path))
+    spec = importlib.util.spec_from_file_location(
+        "bt_big_qmt_gateway_strategy_sample_for_test", str(path)
+    )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_big_qmt_helper_source_keeps_gbk_encoding():
+    """验证嵌入大 QMT 的策略源码保持 GBK 声明和真实字节编码。
+
+    Returns:
+        None。
+    """
+
+    path = Path(__file__).parents[2] / "helpers" / "big_qmt_gateway_strategy_sample.py"
+    raw = path.read_bytes()
+
+    assert raw.splitlines()[0] == b"#encoding:gbk"
+    assert "补齐单证券快照" in raw.decode("gbk")
+    with pytest.raises(UnicodeDecodeError):
+        raw.decode("utf-8")
 
 
 class _FakeValues:
@@ -174,21 +196,223 @@ def test_big_qmt_helper_keeps_current_tick_as_snapshot_capability():
     assert context.full_tick_codes == ["000001.SZ"]
 
 
+def test_big_qmt_helper_preserves_live_observation_metadata():
+    """验证 helper 保留源时间、查询完成时间和一档盘口。
+
+    Returns:
+        None。
+    """
+
+    helper = _load_helper()
+    context = _FakeContext()
+    context.get_full_tick = lambda stock_code=None: {
+        "000001.SZ": {
+            "lastPrice": 12.3,
+            "timetag": "20260827 09:31:00",
+            "bidPrice": [12.29],
+            "askPrice": [12.31],
+            "openInt": 13,
+        }
+    }
+
+    result = helper._get_full_tick(context, {"security": "000001.XSHE"})
+    tick = result["ticks"]["000001.XSHE"]
+
+    assert tick["source"] == "big_qmt_full_tick"
+    assert tick["source_time"] == "20260827 09:31:00"
+    assert tick["query_completed_time"] == result["query_completed_time"]
+    assert tick["age_seconds"] >= 0.0
+    assert tick["feed_health"]["status"] == "healthy"
+    assert tick["bid_price1"] == 12.29
+    assert tick["ask_price1"] == 12.31
+
+
+def test_big_qmt_helper_computes_tick_age_in_same_clock_domain():
+    """验证 helper 用源时间与查询完成时间计算事件年龄，不读取当前时间伪造。
+
+    Returns:
+        None。
+    """
+
+    helper = _load_helper()
+
+    tick = helper._enrich_tick(
+        None,
+        "000001.SZ",
+        {"lastPrice": 12.3, "timetag": "20260827 09:31:00"},
+        "2026-08-27T09:31:08+08:00",
+    )
+
+    assert tick["source_time"] == "20260827 09:31:00"
+    assert tick["received_time"] == "2026-08-27T09:31:08+08:00"
+    assert tick["age_seconds"] == pytest.approx(8.0)
+
+
+def test_big_qmt_helper_does_not_invent_age_for_unparseable_source_time():
+    """验证源时间不可解析时保持缺失，使上游按合同失败关闭。
+
+    Returns:
+        None。
+    """
+
+    helper = _load_helper()
+
+    tick = helper._enrich_tick(
+        None,
+        "000001.SZ",
+        {
+            "lastPrice": 12.3,
+            "timetag": "unknown",
+            "age_seconds": 0.0,
+            "received_time": "old-received-time",
+        },
+        "2026-08-27T09:31:08+08:00",
+    )
+
+    assert "age_seconds" not in tick
+    assert tick["received_time"] == "2026-08-27T09:31:08+08:00"
+
+
+def test_big_qmt_helper_overwrites_raw_observation_metadata():
+    """验证原始 tick 中的旧观察字段不能覆盖本次查询证据。
+
+    Returns:
+        None。
+    """
+
+    helper = _load_helper()
+
+    tick = helper._enrich_tick(
+        None,
+        "000001.SZ",
+        {
+            "lastPrice": 12.3,
+            "timetag": "20260827 09:31:00",
+            "age_seconds": 0.0,
+            "received_time": "old-received-time",
+            "query_completed_time": "old-query-time",
+            "source": "old-source",
+            "feed_health": {"status": "stale"},
+        },
+        "2026-08-27T09:31:08+08:00",
+    )
+
+    assert tick["age_seconds"] == pytest.approx(8.0)
+    assert tick["received_time"] == "2026-08-27T09:31:08+08:00"
+    assert tick["query_completed_time"] == "2026-08-27T09:31:08+08:00"
+    assert tick["source"] == "big_qmt_full_tick"
+    assert tick["feed_health"]["status"] == "healthy"
+
+
+def test_big_qmt_helper_does_not_clamp_future_event_time_to_zero():
+    """验证事件时间晚于接收时间时不伪造零年龄。
+
+    Returns:
+        None。
+    """
+
+    helper = _load_helper()
+
+    tick = helper._enrich_tick(
+        None,
+        "000001.SZ",
+        {"lastPrice": 12.3, "timetag": "20260827 09:31:09"},
+        "2026-08-27T09:31:08+08:00",
+    )
+
+    assert "age_seconds" not in tick
+
+
+def test_big_qmt_helper_prefers_average_open_price_over_negative_diluted_cost():
+    """验证持仓平均成本优先采用 QMT 平均开仓价并拒绝负摊薄字段。
+
+    Returns:
+        None。
+    """
+
+    helper = _load_helper()
+    position = SimpleNamespace(
+        m_strInstrumentID="159967",
+        m_strExchangeID="SZ",
+        m_nVolume=300,
+        m_nCanUseVolume=300,
+        m_dAvgOpenPrice=0.81,
+        m_dOpenPrice=-58.64929996666666,
+        m_dMarketValue=240.0,
+        m_dLastPrice=0.80,
+    )
+
+    result = helper._position_to_dict(position)
+
+    assert result["avg_cost"] == pytest.approx(0.81)
+    assert result["cost_basis"] == pytest.approx(0.81)
+
+
+def test_big_qmt_helper_replaces_all_invalid_cost_fields_with_zero():
+    """验证所有成本候选均为负数时不把非法成本送入父账户同步。
+
+    Returns:
+        None。
+    """
+
+    helper = _load_helper()
+    position = SimpleNamespace(
+        m_strInstrumentID="159967",
+        m_strExchangeID="SZ",
+        m_nVolume=300,
+        m_nCanUseVolume=300,
+        m_dAvgOpenPrice=-1.0,
+        m_dOpenPrice=-58.0,
+    )
+
+    result = helper._position_to_dict(position)
+
+    assert result["avg_cost"] == 0.0
+    assert result["cost_basis"] == 0.0
+
+
 def test_big_qmt_gateway_handler_reads_request_headers():
     helper = _load_helper()
     handler = object.__new__(helper._GatewayHandler)
-    handler.request = SimpleNamespace(headers=HTTPHeaders({"X-BulletTrade-Request-Id": "r-headers"}))
+    handler.request = SimpleNamespace(
+        headers=HTTPHeaders({"X-BulletTrade-Request-Id": "r-headers"})
+    )
 
     assert handler._request_id() == "r-headers"
 
 
 def test_runtime_health_reports_gateway_build_id():
+    """核对健康信息的 helper 构建号；无输入，返回 None，不启动服务。"""
     helper = _load_helper()
     runtime = helper._GatewayRuntime()
 
     health = runtime.health()
 
+    assert helper.GATEWAY_BUILD_ID == "20260908_dividend_facts_v1"
     assert health["gateway_build_id"] == helper.GATEWAY_BUILD_ID
+
+
+def test_helper_uses_daily_log_rotation_with_five_backups():
+    helper = _load_helper()
+
+    handlers = [
+        handler
+        for handler in helper.LOGGER.handlers
+        if isinstance(handler, TimedRotatingFileHandler)
+    ]
+
+    assert handlers
+    assert helper.LOG_ROTATE_WHEN == "midnight"
+    assert helper.LOG_ROTATE_INTERVAL == 1
+    assert helper.LOG_BACKUP_COUNT == 5
+    assert handlers[0].backupCount == 5
+
+    health = helper._GatewayRuntime().health()
+    assert health["log_rotate_when"] == "midnight"
+    assert health["log_rotate_interval"] == 1
+    assert health["log_backup_count"] == 5
+    assert health["log_rotate_utc"] is False
+    assert health["log_file_size_bytes"] >= 0
 
 
 def test_runtime_reports_context_missing_for_current_tick_without_context():
@@ -196,11 +420,18 @@ def test_runtime_reports_context_missing_for_current_tick_without_context():
     runtime = helper._GatewayRuntime()
     runtime.direct_dispatch = True
 
-    response = runtime.submit("current_tick", {"security": "000001.XSHE", "request_id": "r-no-context"})
+    response = runtime.submit(
+        "current_tick", {"security": "000001.XSHE", "request_id": "r-no-context"}
+    )
 
     assert response["ok"] is False
     assert response["code"] == "QMT_CONTEXT_NOT_READY"
     assert runtime.request_queue.qsize() == 0
+    health = runtime.health()
+    assert health["current_action"] is None
+    assert health["last_action"] == "current_tick"
+    assert health["last_action_request_id"] == "r-no-context"
+    assert health["last_action_elapsed_ms"] >= 0.0
 
 
 def test_runtime_dispatches_account_actions_without_context(monkeypatch):
@@ -212,7 +443,9 @@ def test_runtime_dispatches_account_actions_without_context(monkeypatch):
     monkeypatch.setattr(
         helper,
         "get_trade_detail_data",
-        lambda account_id, account_type, detail_type, *args: [_FakeAccount()] if detail_type == "account" else [],
+        lambda account_id, account_type, detail_type, *args: [_FakeAccount()]
+        if detail_type == "account"
+        else [],
         raising=False,
     )
 
@@ -239,7 +472,9 @@ def test_runtime_bypasses_queue_for_account_actions_even_with_context(monkeypatc
     monkeypatch.setattr(
         helper,
         "get_trade_detail_data",
-        lambda account_id, account_type, detail_type, *args: [_FakeAccount()] if detail_type == "account" else [],
+        lambda account_id, account_type, detail_type, *args: [_FakeAccount()]
+        if detail_type == "account"
+        else [],
         raising=False,
     )
 
@@ -263,6 +498,7 @@ def test_runtime_does_not_queue_when_context_missing_even_in_queue_mode():
 
 
 def test_big_qmt_helper_dispatches_non_tick_data_apis(monkeypatch):
+    """核对非 tick 路由和旧事件字段；输入替身夹具，返回 None，仅调用假 QMT 上下文。"""
     helper = _load_helper()
     context = _FakeContext()
     download_calls = []
@@ -280,18 +516,25 @@ def test_big_qmt_helper_dispatches_non_tick_data_apis(monkeypatch):
     )
     assert history["ok"] is True
     assert history["value"]["dtype"] == "dataframe"
-    assert history["value"]["records"] == [[1.0, 2.0]]
+    assert history["value"]["columns"] == ["index", "open", "close"]
+    assert history["value"]["records"] == [["20260701", 1.0, 2.0]]
+    assert history["value"]["index_columns"] == ["index"]
+    assert history["value"]["index_names"] == [None]
     assert context.history_call[0] == ["open", "close"]
     assert context.history_call[1] == ["000001.SZ"]
     assert context.history_call[2]["period"] == "1d"
     assert download_calls[0][0] == ("000001.SZ", "1d", "", "")
 
-    trade_days = helper._dispatch_qmt_action(context, "trade_days", {"security": "000001.XSHE", "count": 1})
+    trade_days = helper._dispatch_qmt_action(
+        context, "trade_days", {"security": "000001.XSHE", "count": 1}
+    )
     assert trade_days["ok"] is True
     assert trade_days["value"]["values"] == ["20260701"]
     assert context.trade_days_call[0] == "000001.SZ"
 
-    security_info = helper._dispatch_qmt_action(context, "security_info", {"security": "000001.XSHE"})
+    security_info = helper._dispatch_qmt_action(
+        context, "security_info", {"security": "000001.XSHE"}
+    )
     assert security_info["ok"] is True
     assert security_info["value"]["display_name"] == "Ping An Bank"
     assert security_info["value"]["qmt_security"] == "000001.SZ"
@@ -330,7 +573,9 @@ def test_big_qmt_helper_dispatches_non_tick_data_apis(monkeypatch):
     assert context.sector_calls[-1] == "\u6caa\u6df1ETF"
     assert etf_securities["value"]["records"][0][5] == "etf"
 
-    index_stocks = helper._dispatch_qmt_action(context, "index_stocks", {"index_symbol": "000300.XSHG"})
+    index_stocks = helper._dispatch_qmt_action(
+        context, "index_stocks", {"index_symbol": "000300.XSHG"}
+    )
     assert index_stocks["ok"] is True
     assert index_stocks["value"]["stocks"] == ["000001.XSHE", "000002.XSHE"]
     assert index_stocks["value"]["source"] == "sector_fallback"
@@ -341,7 +586,11 @@ def test_big_qmt_helper_dispatches_non_tick_data_apis(monkeypatch):
         {"security": "000001.XSHE", "start": "20200101", "end": "20201231"},
     )
     assert split_dividend["ok"] is True
-    assert split_dividend["value"]["events"] == [
+    legacy_fields = ("security", "date", "security_type", "scale_factor", "bonus_pre_tax", "per_base")
+    assert [
+        {field: event[field] for field in legacy_fields}
+        for event in split_dividend["value"]["events"]
+    ] == [
         {
             "security": "000001.XSHE",
             "date": "2020-01-01",
@@ -353,10 +602,12 @@ def test_big_qmt_helper_dispatches_non_tick_data_apis(monkeypatch):
     ]
 
 
-def test_big_qmt_helper_history_drops_unrequested_stime_column(monkeypatch):
+def test_big_qmt_helper_history_preserves_stime_index(monkeypatch):
     helper = _load_helper()
     context = _FakeContextHistoryWithStime()
-    monkeypatch.setattr(helper, "download_history_data", lambda *args, **kwargs: None, raising=False)
+    monkeypatch.setattr(
+        helper, "download_history_data", lambda *args, **kwargs: None, raising=False
+    )
 
     history = helper._dispatch_qmt_action(
         context,
@@ -365,14 +616,135 @@ def test_big_qmt_helper_history_drops_unrequested_stime_column(monkeypatch):
     )
 
     assert history["ok"] is True
-    assert history["value"]["columns"] == ["open", "close"]
-    assert history["value"]["records"] == [[1.0, 2.0]]
+    assert history["value"]["columns"] == ["stime", "open", "close"]
+    assert history["value"]["records"] == [["20260701093000", 1.0, 2.0]]
+    assert history["value"]["index_columns"] == ["stime"]
+    assert history["value"]["index_names"] == ["stime"]
+
+
+def test_big_qmt_helper_history_normalizes_standard_dates_without_losing_minute_time(
+    monkeypatch,
+):
+    """验证标准日期可供 QMT 使用，分钟时间不会被截成当天零点。
+
+    Args:
+        monkeypatch: pytest 提供的运行时替换工具。
+
+    Returns:
+        None。
+    """
+
+    helper = _load_helper()
+    context = _FakeContext()
+    download_calls = []
+    monkeypatch.setattr(
+        helper,
+        "download_history_data",
+        lambda *args, **kwargs: download_calls.append((args, kwargs)),
+        raising=False,
+    )
+
+    daily = helper._dispatch_qmt_action(
+        context,
+        "history",
+        {
+            "security": "000001.XSHE",
+            "fields": ["open"],
+            "frequency": "daily",
+            "start": "2026-07-01",
+            "end": "2026-07-02",
+        },
+    )
+
+    assert daily["ok"] is True
+    assert download_calls[0][0] == ("000001.SZ", "1d", "20260701", "20260702")
+    assert context.history_call[2]["start_time"] == "20260701"
+    assert context.history_call[2]["end_time"] == "20260702"
+
+    minute = helper._dispatch_qmt_action(
+        context,
+        "history",
+        {
+            "security": "000001.XSHE",
+            "fields": ["open"],
+            "frequency": "minute",
+            "start": "2026-07-01 09:31:00",
+            "end": "2026-07-01 09:32:00",
+        },
+    )
+
+    assert minute["ok"] is True
+    assert download_calls[1][0] == (
+        "000001.SZ",
+        "1m",
+        "20260701093100",
+        "20260701093200",
+    )
+    assert context.history_call[2]["start_time"] == "20260701093100"
+    assert context.history_call[2]["end_time"] == "20260701093200"
+
+
+def test_big_qmt_helper_history_maps_money_to_amount_and_restores_time_index(monkeypatch):
+    """验证 public money 映射到 QMT amount，并在客户端恢复时间索引。
+
+    Args:
+        monkeypatch: pytest 提供的运行时替换工具。
+
+    Returns:
+        None。
+    """
+
+    helper = _load_helper()
+    context = _FakeContext()
+
+    def _get_market_data_ex(fields, stock_code, **kwargs):
+        """返回带未命名时间索引和 QMT amount 字段的模拟历史行情。
+
+        Args:
+            fields: QMT 原生字段列表。
+            stock_code: QMT 证券代码列表。
+            **kwargs: QMT 历史行情查询参数。
+
+        Returns:
+            dict: 按 QMT 证券代码组织的 DataFrame。
+        """
+
+        context.history_call = (fields, stock_code, kwargs)
+        frame = pd.DataFrame(
+            {"open": [10.0], "amount": [123456.0]},
+            index=pd.DatetimeIndex(["2026-07-01"]),
+        )
+        return {stock_code[0]: frame}
+
+    context.get_market_data_ex = _get_market_data_ex
+    monkeypatch.setattr(
+        helper, "download_history_data", lambda *args, **kwargs: None, raising=False
+    )
+
+    history = helper._dispatch_qmt_action(
+        context,
+        "history",
+        {"security": "000001.XSHE", "fields": ["open", "money"], "count": 1},
+    )
+
+    assert history["ok"] is True
+    assert context.history_call[0] == ["open", "amount"]
+    assert history["value"]["columns"] == ["index", "open", "money"]
+    assert history["value"]["records"] == [["2026-07-01T00:00:00", 10.0, 123456.0]]
+
+    restored = _dataframe_from_payload(history["value"])
+    assert isinstance(restored.index, pd.DatetimeIndex)
+    assert restored.index.tolist() == [pd.Timestamp("2026-07-01")]
+    assert restored.columns.tolist() == ["open", "money"]
+    assert restored.iloc[0]["money"] == 123456.0
 
 
 def test_big_qmt_helper_history_uses_miniqmt_ratio_dividend_types(monkeypatch):
     helper = _load_helper()
     context = _FakeContext()
-    monkeypatch.setattr(helper, "download_history_data", lambda *args, **kwargs: None, raising=False)
+    monkeypatch.setattr(
+        helper, "download_history_data", lambda *args, **kwargs: None, raising=False
+    )
 
     helper._dispatch_qmt_action(
         context,
@@ -404,9 +776,16 @@ def test_big_qmt_helper_history_returns_error_when_auto_ensure_fails():
     assert context.history_call is None
 
 
-def test_big_qmt_helper_history_allows_explicit_auto_download_false():
+def test_big_qmt_helper_history_ignores_auto_download_false_for_correctness(monkeypatch):
     helper = _load_helper()
     context = _FakeContext()
+    download_calls = []
+    monkeypatch.setattr(
+        helper,
+        "download_history_data",
+        lambda *args, **kwargs: download_calls.append((args, kwargs)),
+        raising=False,
+    )
 
     history = helper._dispatch_qmt_action(
         context,
@@ -415,6 +794,7 @@ def test_big_qmt_helper_history_allows_explicit_auto_download_false():
     )
 
     assert history["ok"] is True
+    assert len(download_calls) == 1
     assert context.history_call[1] == ["000001.SZ"]
 
 
@@ -422,7 +802,12 @@ def test_big_qmt_helper_index_stocks_prefers_index_weight(monkeypatch):
     helper = _load_helper()
     context = _FakeContextWithIndexWeight()
     download_calls = []
-    monkeypatch.setattr(helper, "download_index_weight", lambda *args, **kwargs: download_calls.append(args), raising=False)
+    monkeypatch.setattr(
+        helper,
+        "download_index_weight",
+        lambda *args, **kwargs: download_calls.append(args),
+        raising=False,
+    )
 
     response = helper._dispatch_qmt_action(context, "index_stocks", {"index_symbol": "000300.XSHG"})
 
@@ -858,7 +1243,9 @@ def test_big_qmt_helper_filters_orders_and_trades_by_virtual_account(monkeypatch
     assert trades["value"]["trades"][0]["sub_account_id"] == "sub-a"
 
 
-def test_big_qmt_helper_matches_pending_virtual_order_tag_when_qmt_remark_is_short_id(monkeypatch, tmp_path):
+def test_big_qmt_helper_matches_pending_virtual_order_tag_when_qmt_remark_is_short_id(
+    monkeypatch, tmp_path
+):
     helper = _load_helper()
     order = _FakeOrder("order-new", volume=100, traded=0, remark="BTSHORTID")
     order.m_dLimitPrice = 1.0
@@ -939,14 +1326,18 @@ def test_big_qmt_helper_date_filter_accepts_epoch_milliseconds():
 
 
 def test_big_qmt_helper_split_dividend_filters_epoch_millisecond_keys(monkeypatch):
+    """用完整七字段事件验证毫秒日期筛选；输入替身夹具，返回 None，不访问外部 QMT。"""
     helper = _load_helper()
 
     class _Context:
+        """仅提供固定除权事件的假上下文，无服务器或交易状态。"""
+
         def get_divid_factors(self, qmt_security):
+            """检查请求代码并返回事件；输入证券代码，返回完整七字段字典，无外部副作用。"""
             assert qmt_security == "000001.SZ"
             return {
-                "673113600000": [1, 2, 3],
-                "1278000000000": [4, 5, 6],
+                "673113600000": [1, 2, 3, 0, 0, 0, 1],
+                "1278000000000": [4, 5, 6, 0, 0, 0, 1],
             }
 
     result = helper._dispatch_qmt_action(
@@ -961,6 +1352,128 @@ def test_big_qmt_helper_split_dividend_filters_epoch_millisecond_keys(monkeypatc
     )
 
     assert result["ok"] is True
-    assert [item["date"] for item in result["value"]["events"]] == [helper._date_iso("1278000000000")]
+    assert [item["date"] for item in result["value"]["events"]] == [
+        helper._date_iso("1278000000000")
+    ]
     assert result["value"]["events"][0]["bonus_pre_tax"] == 40.0
     assert result["value"]["events"][0]["per_base"] == 10
+
+
+@pytest.mark.parametrize("price", [0.0, 0.762, 0.773, 0.774])
+def test_bigqmt_market_tag_uses_exact_customer_identity(monkeypatch, tmp_path, price):
+    """验证市价差异不丢失精确标签；输入临时目录和成交价，返回空并核对冲突。"""
+    helper = _load_helper()
+    monkeypatch.setattr(helper, "LOG_FILE", str(tmp_path / "helper.log"))
+    helper.ORDER_TAG_STORE_LOADED = True
+    tag = dict(
+        security="159967.XSHE",
+        side="SELL",
+        amount=62900,
+        price=0.762,
+        pr_type=44,
+        qmt_user_order_id="BT-exact",
+        sub_account_id="b4-test",
+        order_remark="sub:b4-test|signal:286/exec:176",
+    )
+    row = dict(
+        order_id="real-filled",
+        security="159967.XSHE",
+        side="SELL",
+        amount=62900,
+        order_price=price,
+        qmt_user_order_id="BT-exact",
+        order_remark="BT-exact",
+    )
+    assert helper._order_matches_tag(row, tag)
+    assert not helper._order_matches_tag(dict(row, qmt_user_order_id="BT-other"), tag)
+    assert not helper._order_matches_tag(dict(row, side="BUY"), tag)
+    assert not helper._order_matches_tag(dict(row, amount=100), tag)
+    assert not helper._order_matches_tag(dict(row, sub_account_id="another"), tag)
+    monkeypatch.setattr(helper, "_parse_order_epoch", lambda value: 1000)
+    assert not helper._order_matches_tag(row, dict(tag, created_at=2000))
+    if price in (0.773, 0.774):
+        assert not helper._order_matches_tag(row, dict(tag, pr_type=11))
+    helper.PENDING_ORDER_TAGS = [tag]
+    helper.ORDER_TAGS_BY_ID = {}
+    ambiguous = helper._attach_virtual_tags_to_orders([dict(row), dict(row, order_id="other")])
+    assert all(not item.get("sub_account_id") for item in ambiguous)
+    assert not helper.ORDER_TAGS_BY_ID
+    helper.PENDING_ORDER_TAGS = [tag, dict(tag, sub_account_id="conflicting")]
+    assert not helper._attach_virtual_tags_to_orders([dict(row)])[0].get("sub_account_id")
+    helper.PENDING_ORDER_TAGS = [tag]
+    result = helper._attach_virtual_tags_to_orders([dict(row)])[0]
+    assert result["sub_account_id"] == "b4-test"
+    helper.ORDER_TAG_STORE_LOADED = False
+    helper.PENDING_ORDER_TAGS = []
+    helper.ORDER_TAGS_BY_ID = {}
+    assert helper._attach_virtual_tags_to_orders([dict(row)])[0]["sub_account_id"] == "b4-test"
+
+
+@pytest.mark.parametrize("bound", [False, True])
+@pytest.mark.parametrize("identity_case", ["missing", "conflict", "raw_conflict"])
+def test_bigqmt_helper_never_fabricates_or_overrides_broker_identity(
+    monkeypatch, tmp_path, bound, identity_case
+):
+    """验证已绑定和待绑定都保留身份缺口；输入绑定状态和冲突种类，返回空并核对标签。"""
+    helper = _load_helper()
+    monkeypatch.setattr(helper, "LOG_FILE", str(tmp_path / "helper.log"))
+    helper.ORDER_TAG_STORE_LOADED = True
+    tag = dict(
+        security="159967.XSHE",
+        side="SELL",
+        amount=62900,
+        price=0.762,
+        pr_type=44,
+        qmt_user_order_id="BT-local",
+        sub_account_id="b4-test",
+        order_remark="sub:b4-test|signal:286/exec:176",
+    )
+    row = dict(
+        order_id="untrusted-order",
+        security="159967.XSHE",
+        side="SELL",
+        amount=62900,
+        order_price=0.762,
+        qmt_user_order_id="",
+        order_remark="",
+    )
+    if identity_case == "conflict":
+        row["qmt_user_order_id"] = "BT-another"
+    elif identity_case == "raw_conflict":
+        row["qmt_user_order_id"] = "BT-local"
+        row["raw"] = {"m_strUserOrderId": "BT-another"}
+    helper.PENDING_ORDER_TAGS = [tag]
+    helper.ORDER_TAGS_BY_ID = {row["order_id"]: dict(tag)} if bound else {}
+    result = helper._attach_virtual_tags_to_orders([dict(row)])[0]
+    assert not result.get("sub_account_id")
+    assert not result.get("order_remark")
+    assert result["qmt_user_order_id"] == row["qmt_user_order_id"]
+
+
+def test_bigqmt_helper_keeps_unkeyed_legacy_tag_without_creating_identity(monkeypatch, tmp_path):
+    """验证两端无客户键的历史标签兼容；输入临时目录，返回空并保证不会合成强身份。"""
+    helper = _load_helper()
+    monkeypatch.setattr(helper, "LOG_FILE", str(tmp_path / "helper.log"))
+    helper.ORDER_TAG_STORE_LOADED = True
+    helper.ORDER_TAGS_BY_ID = {}
+    helper.PENDING_ORDER_TAGS = [
+        dict(
+            security="159967.XSHE",
+            side="SELL",
+            amount=62900,
+            price=0.762,
+            pr_type=11,
+            sub_account_id="legacy-sub",
+            order_remark="legacy-remark",
+        )
+    ]
+    row = dict(
+        order_id="legacy-order",
+        security="159967.XSHE",
+        side="SELL",
+        amount=62900,
+        order_price=0.762,
+    )
+    result = helper._attach_virtual_tags_to_orders([row])[0]
+    assert result["sub_account_id"] == "legacy-sub"
+    assert not result.get("qmt_user_order_id")

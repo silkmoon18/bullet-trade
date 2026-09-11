@@ -2,15 +2,21 @@ import asyncio
 import concurrent.futures
 import threading
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pandas as pd
 import pytest
 
 from bullet_trade.broker import RemoteQmtBroker
-from bullet_trade.remote import RemoteQmtConnection
+from bullet_trade.remote import (
+    RemoteQmtConnection,
+    RemoteServerError,
+    RemoteSubmissionUnknownError,
+    classify_remote_action,
+)
 from bullet_trade.server.adapters.base import AccountRouter
 from bullet_trade.server.adapters.stub import build_stub_bundle  # noqa: F401
-from bullet_trade.server.app import ServerApplication
+from bullet_trade.server.app import IdempotencyConflictError, ServerApplication
 from bullet_trade.server.config import AccountConfig, ServerConfig
 from bullet_trade.server.session import ClientSession
 
@@ -80,6 +86,69 @@ def _make_connection(cfg: ServerConfig) -> RemoteQmtConnection:
     return conn
 
 
+@pytest.mark.parametrize(
+    ("connection_kwargs", "expected_timeout"),
+    [({}, 10.0), ({"connect_timeout": 30.0}, 30.0)],
+)
+def test_remote_connection_start_uses_configured_connect_timeout(
+    monkeypatch,
+    connection_kwargs,
+    expected_timeout,
+):
+    """连接启动应兼容默认 10 秒，并允许调用方显式延长握手等待。
+
+    Args:
+        monkeypatch: pytest 属性替换工具。
+        connection_kwargs: 当前用例传给连接构造器的额外参数。
+        expected_timeout: 期望传给连接完成事件的等待秒数。
+
+    Returns:
+        None。
+    """
+
+    class _NoopThread:
+        """替代后台连接线程，确保单测不访问网络。"""
+
+        def __init__(self, *args, **kwargs):
+            """接收 Thread 兼容参数但不保存连接目标。
+
+            Args:
+                args: Thread 位置参数。
+                kwargs: Thread 关键字参数。
+
+            Returns:
+                None。
+            """
+
+            self.started = False
+
+        def start(self):
+            """只记录启动，不运行目标函数。
+
+            Returns:
+                None。
+            """
+
+            self.started = True
+
+    monkeypatch.setattr(
+        "bullet_trade.remote.connection.threading.Thread",
+        _NoopThread,
+    )
+    connection = RemoteQmtConnection(
+        "127.0.0.1",
+        0,
+        "token",
+        **connection_kwargs,
+    )
+    connection._connected.wait = Mock(return_value=False)
+
+    with pytest.raises(RuntimeError, match="连接 qmt server 超时"):
+        connection.start()
+
+    connection._connected.wait.assert_called_once_with(timeout=expected_timeout)
+
+
 def test_remote_connection_request_cancels_pending_future_on_timeout(monkeypatch):
     """同步 request 超时时应取消后台协程，避免长连接 pending 状态残留。"""
 
@@ -124,8 +193,8 @@ def test_remote_connection_default_timeout_applies_while_reconnecting(monkeypatc
     assert background_future.cancelled()
 
 
-def test_remote_connection_explicit_none_timeout_keeps_legacy_wait(monkeypatch):
-    """显式 timeout=None 时保留旧版无限等待语义，省略参数才用默认保护窗口。"""
+def test_remote_connection_uses_action_default_and_keeps_explicit_timeout(monkeypatch):
+    """历史请求使用长默认值，显式超时和旧版无限等待语义保持不变。"""
 
     class _RecordedFuture:
         def __init__(self):
@@ -151,9 +220,469 @@ def test_remote_connection_explicit_none_timeout_keeps_legacy_wait(monkeypatch):
     monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", _run_coroutine_threadsafe)
 
     assert conn.request("broker.account", {}) == {"ok": True}
+    assert conn.request("data.history", {}) == {"ok": True}
     assert conn.request("broker.account", {}, timeout=None) == {"ok": True}
+    assert conn.request("data.history", {}, timeout=45) == {"ok": True}
 
-    assert recorded_future.timeouts == [60, None]
+    assert recorded_future.timeouts == [60, 180.0, None, 45]
+
+
+def test_remote_connection_classifies_concrete_write_actions():
+    """远程 action 必须按具体名称分类，不得用模糊前缀猜测。"""
+
+    assert classify_remote_action("broker.place_order") == "ambiguous_write"
+    assert classify_remote_action("broker.cancel_order") == "ambiguous_write"
+    assert classify_remote_action("broker.resolve_submission") == "none"
+    assert classify_remote_action("broker.orders") == "none"
+    assert classify_remote_action("broker.install_source_snapshot") == "idempotent_transition"
+    assert classify_remote_action("data.subscribe") == "idempotent_transition"
+
+
+@pytest.mark.parametrize(
+    ("action", "payload"),
+    [
+        (
+            "broker.place_order",
+            {
+                "security": "000001.XSHE",
+                "side": "BUY",
+                "amount": 100,
+                "style": {"type": "limit", "price": 10.0},
+            },
+        ),
+        ("broker.cancel_order", {"order_id": "order-to-cancel"}),
+    ],
+)
+def test_remote_connection_does_not_retry_ambiguous_write_after_response_loss(action, payload):
+    """写帧发出后响应丢失必须只发送一次，并保留原幂等键。"""
+
+    conn = RemoteQmtConnection("127.0.0.1", 0, "token")
+    conn._connected.set()
+    sent = []
+
+    async def _send_and_drop(message):
+        """记录写帧后模拟服务端响应丢失。"""
+
+        sent.append(message)
+        conn._pending[message["id"]].set_exception(RuntimeError("连接已断开"))
+
+    conn._send = _send_and_drop  # type: ignore[method-assign]
+
+    async def _run():
+        """执行一次模糊写并返回未知异常。"""
+
+        with pytest.raises(RemoteSubmissionUnknownError) as exc_info:
+            request_payload = dict(payload)
+            request_payload["idempotency_key"] = "disconnect-write-once"
+            await conn._request_async(action, request_payload)
+        return exc_info.value
+
+    error = asyncio.run(_run())
+
+    assert len(sent) == 1
+    assert sent[0]["action"] == action
+    assert sent[0]["payload"]["idempotency_key"] == "disconnect-write-once"
+    assert error.idempotency_key == "disconnect-write-once"
+
+
+def test_remote_broker_resolves_response_loss_without_resending_order(monkeypatch):
+    """标准远程 Broker 应用原 key 只读解析丢失响应，不重发下单。"""
+
+    class _ResolveAfterDropConnection:
+        """模拟下单已送达、响应丢失，但只读解析成功的连接。"""
+
+        def __init__(self):
+            """初始化写帧和解析请求记录。"""
+
+            self.write_requests = []
+            self.resolve_requests = []
+
+        def start(self):
+            """模拟连接启动。"""
+
+            return None
+
+        def close(self):
+            """模拟连接关闭。"""
+
+            return None
+
+        def request(self, action, payload, timeout=30.0):
+            """记录唯一下单帧并模拟响应丢失。"""
+
+            self.write_requests.append((action, dict(payload), timeout))
+            raise RemoteSubmissionUnknownError(
+                action,
+                str(payload["idempotency_key"]),
+                payload,
+                message="deterministic response loss",
+            )
+
+        def resolve_submission(
+            self,
+            idempotency_key,
+            *,
+            write_action,
+            request_payload=None,
+            order_id=None,
+            context=None,
+            timeout=30.0,
+        ):
+            """记录原 key 只读解析并返回已接受事实。"""
+
+            self.resolve_requests.append(
+                {
+                    "idempotency_key": idempotency_key,
+                    "write_action": write_action,
+                    "request_payload": dict(request_payload or {}),
+                    "order_id": order_id,
+                    "context": dict(context or {}),
+                    "timeout": timeout,
+                }
+            )
+            return {
+                "status": "accepted",
+                "submission_state": "accepted",
+                "write_action": "broker.place_order",
+                "idempotency_key": idempotency_key,
+                "order_id": "resolved-order-1",
+                "resolved_result": {
+                    "order_id": "resolved-order-1",
+                    "status": "open",
+                    "security": request_payload["security"],
+                    "side": request_payload["side"],
+                    "amount": request_payload["amount"],
+                    "idempotency_key": idempotency_key,
+                },
+            }
+
+    monkeypatch.setenv("QMT_SERVER_TOKEN", "dummy-token")
+    broker = RemoteQmtBroker(account_id="acc")
+    connection = _ResolveAfterDropConnection()
+    broker._connection = connection  # type: ignore[assignment]
+    broker.connect()
+
+    order_id = broker._place_order_sync(
+        "BUY",
+        "000001.XSHE",
+        100,
+        10.0,
+        0,
+        extra={"idempotency_key": "signal-execution-stable-key"},
+    )
+
+    assert order_id == "resolved-order-1"
+    assert len(connection.write_requests) == 1
+    assert connection.write_requests[0][0] == "broker.place_order"
+    assert len(connection.resolve_requests) == 1
+    assert connection.resolve_requests[0]["idempotency_key"] == "signal-execution-stable-key"
+    assert (
+        connection.resolve_requests[0]["request_payload"]["idempotency_key"]
+        == "signal-execution-stable-key"
+    )
+
+
+def test_remote_connection_retries_read_once_after_disconnect():
+    """普通只读请求断连后可受控重连重试，并只返回一份结果。"""
+
+    conn = RemoteQmtConnection("127.0.0.1", 0, "token")
+    conn._connected.set()
+    sent = []
+
+    async def _send_disconnect_then_respond(message):
+        """首帧模拟断连，第二帧返回确定的只读结果。"""
+
+        sent.append(message)
+        pending = conn._pending[message["id"]]
+        if len(sent) == 1:
+            pending.set_exception(RuntimeError("连接已断开"))
+        else:
+            pending.set_result({"value": {"available_cash": 1000.0}})
+
+    conn._send = _send_disconnect_then_respond  # type: ignore[method-assign]
+
+    result = asyncio.run(conn._request_async("broker.account", {"account_key": "default"}))
+
+    assert result == {"value": {"available_cash": 1000.0}}
+    assert [message["action"] for message in sent] == ["broker.account", "broker.account"]
+
+
+def test_remote_connection_retries_idempotent_snapshot_install_once_after_disconnect():
+    """快照安装断连后可按同一 generation/digest 载荷重试一次。
+
+    Returns:
+        None。
+    """
+
+    conn = RemoteQmtConnection("127.0.0.1", 0, "token")
+    conn._connected.set()
+    sent = []
+
+    async def _send_disconnect_then_noop(message):
+        """首帧模拟响应丢失，第二帧返回服务端幂等 no-op。
+
+        Args:
+            message: Remote connection 发出的请求帧。
+
+        Returns:
+            None。
+        """
+
+        sent.append(message)
+        pending = conn._pending[message["id"]]
+        if len(sent) == 1:
+            pending.set_exception(RuntimeError("连接已断开"))
+        else:
+            pending.set_result({"installed": False, "noop": True, "generation": 7})
+
+    conn._send = _send_disconnect_then_noop  # type: ignore[method-assign]
+    payload = {"snapshot": {"generation": 7, "payload_digest_sha256": "a" * 64}}
+
+    result = asyncio.run(conn._request_async("broker.install_source_snapshot", payload))
+
+    assert result == {"installed": False, "noop": True, "generation": 7}
+    assert len(sent) == 2
+    assert sent[0]["payload"] == sent[1]["payload"] == payload
+    assert all(message["action"] == "broker.install_source_snapshot" for message in sent)
+
+
+def test_snapshot_install_reuses_deep_copied_payload() -> None:
+    """验证快照安装断连后只重试一次且复用完全相同的深拷贝载荷。
+
+    Returns:
+        None。
+    """
+
+    conn = RemoteQmtConnection("127.0.0.1", 0, "token")
+    conn._connected.set()
+    payload = {
+        "account_key": "default",
+        "snapshot": {"generation": 7, "payload_digest_sha256": "a" * 64},
+    }
+    sent = []
+
+    async def _send_disconnect_then_noop(message):
+        """首帧模拟瞬态断连，第二帧返回幂等 no-op。
+
+        Args:
+            message: Remote connection 发出的请求帧。
+
+        Returns:
+            None。
+        """
+
+        sent.append(message)
+        pending = conn._pending[message["id"]]
+        if len(sent) == 1:
+            payload["snapshot"]["generation"] = 99
+            pending.set_exception(RuntimeError("连接已断开"))
+        else:
+            pending.set_result({"installed": False, "noop": True, "generation": 7})
+
+    conn._send = _send_disconnect_then_noop  # type: ignore[method-assign]
+
+    result = asyncio.run(conn._request_async("broker.install_source_snapshot", payload))
+
+    assert result == {"installed": False, "noop": True, "generation": 7}
+    assert len(sent) == 2
+    assert payload["snapshot"]["generation"] == 99
+    assert sent[0]["payload"] == sent[1]["payload"]
+    assert sent[0]["payload"]["snapshot"]["generation"] == 7
+    assert sent[0]["payload"] is sent[1]["payload"]
+
+
+def test_snapshot_install_stops_after_two_transient_attempts() -> None:
+    """验证快照安装连续瞬态失败时总发送次数不超过两次。
+
+    Returns:
+        None。
+    """
+
+    conn = RemoteQmtConnection("127.0.0.1", 0, "token")
+    conn._connected.set()
+    sent = []
+
+    async def _send_disconnect(message):
+        """让每一次请求都以瞬态断连结束。
+
+        Args:
+            message: Remote connection 发出的请求帧。
+
+        Returns:
+            None。
+        """
+
+        sent.append(message)
+        conn._pending[message["id"]].set_exception(RuntimeError("连接已断开"))
+
+    conn._send = _send_disconnect  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="连接已断开"):
+        asyncio.run(
+            conn._request_async(
+                "broker.install_source_snapshot",
+                {"snapshot": {"generation": 8, "payload_digest_sha256": "b" * 64}},
+            )
+        )
+
+    assert len(sent) == 2
+
+
+def test_snapshot_install_does_not_retry_explicit_server_error() -> None:
+    """验证服务端明确拒绝安装时不进行第二次请求。
+
+    Returns:
+        None。
+    """
+
+    conn = RemoteQmtConnection("127.0.0.1", 0, "token")
+    conn._connected.set()
+    sent = []
+
+    async def _send_rejected(message):
+        """返回确定的服务端合同错误。
+
+        Args:
+            message: Remote connection 发出的请求帧。
+
+        Returns:
+            None。
+        """
+
+        sent.append(message)
+        conn._pending[message["id"]].set_exception(
+            RuntimeError("source_snapshot_generation_replayed")
+        )
+
+    conn._send = _send_rejected  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="generation_replayed"):
+        asyncio.run(
+            conn._request_async(
+                "broker.install_source_snapshot",
+                {"snapshot": {"generation": 7, "payload_digest_sha256": "a" * 64}},
+            )
+        )
+
+    assert len(sent) == 1
+
+
+def test_regular_read_keeps_retrying_beyond_snapshot_install_limit() -> None:
+    """验证普通只读请求仍保留基线的多次瞬态重试行为。
+
+    Returns:
+        None。
+    """
+
+    conn = RemoteQmtConnection("127.0.0.1", 0, "token")
+    conn._connected.set()
+    sent = []
+
+    async def _send_three_disconnects_then_respond(message):
+        """前三帧模拟瞬态断连，第四帧返回只读结果。
+
+        Args:
+            message: Remote connection 发出的请求帧。
+
+        Returns:
+            None。
+        """
+
+        sent.append(message)
+        pending = conn._pending[message["id"]]
+        if len(sent) <= 3:
+            pending.set_exception(RuntimeError("连接已断开"))
+        else:
+            pending.set_result({"value": {"available_cash": 1000.0}})
+
+    conn._send = _send_three_disconnects_then_respond  # type: ignore[method-assign]
+
+    result = asyncio.run(conn._request_async("broker.account", {"account_key": "default"}))
+
+    assert result == {"value": {"available_cash": 1000.0}}
+    assert len(sent) == 4
+
+
+def test_remote_server_direct_idempotency_and_resolution_contract():
+    """服务端应防止同 key 异载荷，并以缓存/强订单键只读解析。"""
+
+    _ensure_current_event_loop()
+    config = ServerConfig(
+        server_type="stub",
+        listen="127.0.0.1",
+        port=0,
+        token="stub-token",
+        enable_data=True,
+        enable_broker=True,
+        accounts=[AccountConfig(key="default", account_id="demo")],
+    )
+    router = AccountRouter(config.accounts)
+    bundle = build_stub_bundle(config, router)
+    app = ServerApplication(config, router, bundle)
+    session = SimpleNamespace(account_key="default", sub_account_id=None)
+    payload = {
+        "security": "000001.XSHE",
+        "side": "BUY",
+        "amount": 100,
+        "style": {"type": "limit", "price": 10.0},
+        "idempotency_key": "direct-server-idem-1",
+    }
+
+    async def _run():
+        """在单一事件循环中验证幂等占位、冲突和结果解析。"""
+
+        first = await app._dispatch_broker(session, "place_order", dict(payload))
+        second = await app._dispatch_broker(session, "place_order", dict(payload))
+        cached_resolution = await app._dispatch_broker(
+            session,
+            "resolve_submission",
+            {
+                "idempotency_key": payload["idempotency_key"],
+                "write_action": "broker.place_order",
+                "request_payload": dict(payload),
+            },
+        )
+        conflicting = dict(payload)
+        conflicting["amount"] = 200
+        with pytest.raises(IdempotencyConflictError):
+            await app._dispatch_broker(session, "place_order", conflicting)
+        app._idempotency_cache.clear()
+        query_resolution = await app._dispatch_broker(
+            session,
+            "resolve_submission",
+            {
+                "idempotency_key": payload["idempotency_key"],
+                "write_action": "broker.place_order",
+                "request_payload": dict(payload),
+            },
+        )
+        unknown_resolution = await app._dispatch_broker(
+            session,
+            "resolve_submission",
+            {
+                "idempotency_key": "missing-idem-key",
+                "write_action": "broker.place_order",
+                "request_payload": {
+                    "security": "600000.XSHG",
+                    "side": "BUY",
+                    "amount": 100,
+                    "style": {"type": "limit", "price": 9.0},
+                },
+            },
+        )
+        orders = await bundle.broker_adapter.list_orders(router.get("default"))
+        return first, second, cached_resolution, query_resolution, unknown_resolution, orders
+
+    first, second, cached, queried, unknown, orders = asyncio.run(_run())
+
+    assert first["order_id"] == second["order_id"]
+    assert len(orders) == 1
+    assert cached["status"] == "accepted"
+    assert cached["evidence"]["source"] == "idempotency_cache"
+    assert queried["status"] == "accepted"
+    assert queried["evidence"]["source"] == "broker_order_query"
+    assert unknown["status"] == "submit_unknown"
+    assert unknown["order_id"].startswith("submit_unknown:")
 
 
 def test_server_session_extends_place_order_timeout_for_long_wait():
@@ -162,6 +691,7 @@ def test_server_session_extends_place_order_timeout_for_long_wait():
     session = ClientSession.__new__(ClientSession)
 
     assert session._request_timeout_for("broker.account", {}) == 60.0
+    assert session._request_timeout_for("data.history", {}) == 150.0
     assert session._request_timeout_for("broker.place_order", {"wait_timeout": 16}) == 60.0
     assert session._request_timeout_for("broker.place_order", {"wait_timeout": 90}) == 120.0
     assert session._request_timeout_for("broker.place_order", {"wait_timeout": "bad"}) == 60.0
@@ -175,6 +705,7 @@ def test_server_session_request_timeout_can_be_configured(monkeypatch):
 
     assert session._request_timeout_for("broker.account", {}) == 130.0
     assert session._request_timeout_for("data.get_index_stocks", {}) == 130.0
+    assert session._request_timeout_for("data.history", {}) == 150.0
     assert session._request_timeout_for("broker.place_order", {"wait_timeout": 90}) == 130.0
 
 
@@ -186,6 +717,7 @@ def test_server_session_request_timeout_ignores_invalid_env(monkeypatch):
     monkeypatch.setenv("QMT_SERVER_REQUEST_TIMEOUT", "-1")
 
     assert session._request_timeout_for("broker.account", {}) == 60.0
+    assert session._request_timeout_for("data.history", {}) == 150.0
 
 
 def test_server_session_treats_winerror64_as_expected_disconnect():
@@ -581,6 +1113,33 @@ def test_stub_server_place_order_idempotency(stub_server):
         conn.close()
 
 
+def test_stub_server_returns_stable_idempotency_conflict_code(stub_server):
+    """同 key 异载荷必须返回稳定冲突码，且不得创建第二笔委托。"""
+
+    conn = _make_connection(stub_server)
+    try:
+        before = conn.request("broker.orders", {})
+        payload = {
+            "security": "600000.XSHG",
+            "side": "BUY",
+            "amount": 100,
+            "style": {"type": "limit", "price": 9.0},
+            "idempotency_key": "idem-conflict-code-1",
+        }
+        conn.request("broker.place_order", payload)
+        conflicting = dict(payload)
+        conflicting["amount"] = 200
+
+        with pytest.raises(RemoteServerError) as exc_info:
+            conn.request("broker.place_order", conflicting)
+
+        assert exc_info.value.code == "IDEMPOTENCY_CONFLICT"
+        after = conn.request("broker.orders", {})
+        assert len(after) == len(before) + 1
+    finally:
+        conn.close()
+
+
 def test_remote_data_provider_dataframe_conversion():
     from bullet_trade.data.providers.remote_qmt import _dataframe_from_payload
 
@@ -643,6 +1202,85 @@ def test_remote_data_provider_security_info_supports_flat_response():
     info = provider.get_security_info("518880.XSHG")
     assert info["display_name"] == "黄金ETF"
     assert info["type"] == "etf"
+
+
+def test_remote_data_provider_routes_live_current_contract():
+    """验证实时当前行情只路由正式 action，并原样透传服务端字段。"""
+
+    from bullet_trade.data.providers.remote_qmt import RemoteQmtProvider
+
+    provider = object.__new__(RemoteQmtProvider)
+    response = {
+        "security": "159915.XSHE",
+        "last_price": 2.345,
+        "paused": False,
+        "high_limit": 2.57,
+        "low_limit": 2.1,
+    }
+    request = Mock(return_value=response)
+    provider._connection = SimpleNamespace(request=request)
+
+    result = provider.get_live_current("159915.XSHE")
+
+    assert result is response
+    request.assert_called_once_with(
+        "data.live_current",
+        {"security": "159915.XSHE"},
+    )
+
+
+def test_remote_data_provider_live_current_fails_closed():
+    """验证实时当前行情远端失败时向上抛错且不会回退到 snapshot。"""
+
+    from bullet_trade.data.providers.remote_qmt import RemoteQmtProvider
+
+    provider = object.__new__(RemoteQmtProvider)
+    request = Mock(side_effect=RuntimeError("live current unavailable"))
+    provider._connection = SimpleNamespace(request=request)
+
+    with pytest.raises(RuntimeError, match="live current unavailable"):
+        provider.get_live_current("159915.XSHE")
+
+    request.assert_called_once_with(
+        "data.live_current",
+        {"security": "159915.XSHE"},
+    )
+
+
+def test_remote_data_provider_dispatches_standard_tick_callback():
+    """验证远程 provider 按标准单参数合同向 LiveEngine 分发 tick。"""
+
+    from bullet_trade.data.providers.remote_qmt import RemoteQmtProvider
+
+    provider = object.__new__(RemoteQmtProvider)
+    provider._tick_callback = None
+    provider._tick_context = None
+    received = []
+    provider.set_tick_callback(lambda tick: received.append(tick))
+
+    provider._handle_tick_event({"symbol": "000001.SZ", "lastPrice": 12.34, "time": "09:30:00"})
+
+    assert received == [{"sid": "000001.XSHE", "last_price": 12.34, "dt": "09:30:00"}]
+
+
+def test_remote_data_provider_preserves_legacy_context_callback():
+    """验证远程 provider 仍兼容 Core API 的双参数回调。"""
+
+    from bullet_trade.data.providers.remote_qmt import RemoteQmtProvider
+
+    provider = object.__new__(RemoteQmtProvider)
+    provider._tick_callback = None
+    provider._tick_context = None
+    received = []
+    context = object()
+    provider.set_tick_callback(
+        lambda ctx, tick: received.append((ctx, tick)),
+        context,
+    )
+
+    provider._handle_tick_event({"sid": "600000.SH", "last_price": 8.76})
+
+    assert received == [(context, {"sid": "600000.XSHG", "last_price": 8.76, "dt": None})]
 
 
 @pytest.mark.asyncio

@@ -134,12 +134,21 @@ def set_commission(per_trade: PerTrade) -> None: ...
 def set_universe(stocks: Iterable[str]) -> None: ...
 def set_slippage(slippage: Any, type: Optional[str] = ..., ref: Optional[str] = ...) -> None: ...
 
+# BulletTrade extension; not provided by the hosted JoinQuant runtime.
+def require_data_capabilities(
+    required: Sequence[str] = ...,
+    optional: Sequence[str] = ...,
+    profile: Optional[str] = ...,
+    schema_version: Optional[str] = ...,
+) -> Any: ...
+
 def order(
     security: str,
     amount: int,
     price: Optional[float] = ...,
     style: Optional[Union[OrderStyle, MarketOrderStyle, LimitOrderStyle]] = ...,
     wait_timeout: Optional[float] = ...,
+    extra: Optional[Dict[str, Any]] = ...,
 ) -> Optional[Order]: ...
 def order_value(
     security: str,
@@ -170,8 +179,9 @@ def get_orders(
     security: Optional[str] = ...,
     status: Optional[object] = ...,
     from_broker: bool = ...,
+    strict: bool = ...,
 ) -> Dict[str, Order]: ...
-def get_trades(order_id: Optional[str] = ..., security: Optional[str] = ...) -> Dict[str, Trade]: ...
+def get_trades(order_id: Optional[str] = ..., security: Optional[str] = ..., strict: bool = ...) -> Dict[str, Trade]: ...
 
 def run_daily(
     func: Callable[..., Any],

@@ -40,6 +40,8 @@ class SubAccountConfig:
 
 @dataclass
 class ServerConfig:
+    """保存通用远程服务及显式华鑫 Trader/XMD 模块配置。"""
+
     server_type: str = "qmt"
     listen: str = "0.0.0.0"
     port: int = 58620
@@ -59,7 +61,6 @@ class ServerConfig:
     log_account_snapshot: bool = False
     access_log_enabled: bool = True
     order_risk_enabled: bool = False
-    idempotency_ttl_seconds: int = 300
     strategy_database_path: Optional[str] = None
     strategy_trading_enabled: bool = False
     strategy_enabled_ids: List[str] = field(default_factory=list)
@@ -77,6 +78,16 @@ class ServerConfig:
     dashboard_port: int = 8080
     dashboard_token: str = ""
     dashboard_sample_interval_seconds: int = 60
+    idempotency_max_entries: int = 50000
+    huaxin_xmd_backend: Optional[str] = None
+    huaxin_xmd_python: Optional[str] = None
+    huaxin_xmd_sdk_dir: Optional[str] = None
+    huaxin_xmd_front: Optional[str] = None
+    huaxin_xmd_max_age_seconds: float = 30.0
+    huaxin_xmd_simulation_replay: bool = False
+    huaxin_xmd_connect_timeout: float = 15.0
+    huaxin_xmd_command_timeout: float = 5.0
+    huaxin_xmd_snapshot_timeout: float = 5.0
 
 
 def _split_items(raw: Optional[str]) -> List[str]:
@@ -120,7 +131,7 @@ def _parse_accounts(raw: Optional[str]) -> Dict[str, AccountConfig]:
 
 
 def _parse_sub_accounts(raw: Optional[str]) -> List[SubAccountConfig]:
-    items = []
+    items: List[SubAccountConfig] = []
     if not raw:
         return items
     for token in _split_items(raw):
@@ -149,23 +160,77 @@ def _parse_sub_accounts(raw: Optional[str]) -> List[SubAccountConfig]:
     return items
 
 
-def _parse_allowlist(raw: Optional[str]) -> List[str]:
+def _is_loopback_listener(value: str) -> bool:
+    """判断监听地址是否仅为本机回环。
+
+    Args:
+        value: CLI 或环境变量提供的监听地址。
+
+    Returns:
+        bool: localhost、IPv4/IPv6 loopback 时为 True。
+    """
+
+    text = str(value or "").strip().lower()
+    if text == "localhost":
+        return True
+    try:
+        return bool(ipaddress.ip_address(text).is_loopback)
+    except ValueError:
+        return False
+
+
+def _parse_allowlist(raw: Optional[str], *, strict: bool = False) -> List[str]:
+    """解析并规范化来源 IP/CIDR 白名单。
+
+    Args:
+        raw: 逗号或分号分隔的 IP/CIDR。
+        strict: 遇到任一非法项时是否立即失败。
+
+    Returns:
+        List[str]: 规范化为显式前缀的网络列表；IPv6 单地址使用 /128。
+
+    Raises:
+        ValueError: strict=True 且存在非法条目。
+    """
+
     result = []
+    invalid = []
     for item in _split_items(raw):
         try:
-            # Support CIDR or explicit hosts
             if "/" in item:
-                ipaddress.ip_network(item, strict=False)
+                network = ipaddress.ip_network(item, strict=False)
             else:
-                ipaddress.ip_address(item)
-            result.append(item)
+                address = ipaddress.ip_address(item)
+                network = ipaddress.ip_network(
+                    f"{address}/{address.max_prefixlen}",
+                    strict=False,
+                )
+            result.append(network.with_prefixlen)
         except ValueError:
-            continue
+            invalid.append(item)
+    if strict and invalid:
+        raise ValueError("Huaxin server allowlist 含非法 IP/CIDR: " + ", ".join(invalid))
     return result
 
 
 def build_server_config(args) -> ServerConfig:
+    """合并 CLI 与环境变量，构造不触发任何后端连接的服务配置。
+
+    Args:
+        args: argparse namespace 或提供同名属性的测试对象。
+
+    Returns:
+        ServerConfig: 已完成基础类型转换的服务配置。
+
+    Raises:
+        ValueError: TLS 配置不完整或严格白名单包含非法条目时抛出。
+
+    Side Effects:
+        仅读取当前进程环境；不读取 secret 文件内容、不创建网络或 SDK 会话。
+    """
+
     server_type = getattr(args, "server_type", None) or get_env("QMT_SERVER_TYPE", "qmt")
+    huaxin_server = str(server_type or "").strip().lower() in {"huaxin", "huaxin-tora"}
     listen = getattr(args, "listen", None) or get_env("QMT_SERVER_LISTEN", "0.0.0.0")
     port = getattr(args, "port", None)
     if port is None:
@@ -187,10 +252,15 @@ def build_server_config(args) -> ServerConfig:
     )
     tls_cert = getattr(args, "tls_cert", None) or get_env("QMT_SERVER_TLS_CERT")
     tls_key = getattr(args, "tls_key", None) or get_env("QMT_SERVER_TLS_KEY")
+    if bool(tls_cert) != bool(tls_key):
+        raise ValueError("TLS 配置不完整：证书和私钥必须同时提供")
     tls_enabled = bool(tls_cert and tls_key)
     tls = TLSConfig(enabled=tls_enabled, cert_path=tls_cert, key_path=tls_key)
     allowlist_raw = getattr(args, "allowlist", None) or get_env("QMT_SERVER_ALLOWLIST")
-    allowlist = _parse_allowlist(allowlist_raw)
+    allowlist = _parse_allowlist(
+        allowlist_raw,
+        strict=huaxin_server and not _is_loopback_listener(listen),
+    )
     max_connections = getattr(args, "max_connections", None)
     if max_connections is None:
         max_connections = get_env_int("QMT_SERVER_MAX_CONNECTIONS", 64)
@@ -208,24 +278,54 @@ def build_server_config(args) -> ServerConfig:
         flag = get_env_optional_bool("QMT_SERVER_ACCESS_LOG")
         access_log_enabled = True if flag is None else bool(flag)
     order_risk_enabled = get_env_bool("QMT_SERVER_ORDER_RISK_ENABLED", False)
-    idempotency_ttl_seconds = get_env_int("QMT_SERVER_IDEMPOTENCY_TTL_SECONDS", 300)
     strategy_database_path = get_env("QMT_STRATEGY_LEDGER_DB")
+    idempotency_max_entries = get_env_int("QMT_SERVER_IDEMPOTENCY_MAX_ENTRIES", 50000)
+    if idempotency_max_entries <= 0:
+        raise ValueError("QMT_SERVER_IDEMPOTENCY_MAX_ENTRIES 必须为正整数")
+    huaxin_xmd_backend = get_env("HUAXIN_XMD_BACKEND") if huaxin_server else None
+    huaxin_xmd_python = get_env("HUAXIN_XMD_PYTHON") if huaxin_server else None
+    huaxin_xmd_sdk_dir = get_env("HUAXIN_XMD_SDK_DIR") if huaxin_server else None
+    huaxin_xmd_front = get_env("HUAXIN_XMD_FRONT") if huaxin_server else None
+    huaxin_xmd_max_age_seconds = (
+        get_env_float("HUAXIN_XMD_MAX_AGE_SECONDS", 30.0) if huaxin_server else 30.0
+    )
+    huaxin_xmd_simulation_replay = (
+        get_env_bool("HUAXIN_XMD_SIMULATION_REPLAY", False) if huaxin_server else False
+    )
+    huaxin_xmd_connect_timeout = (
+        get_env_float("HUAXIN_XMD_CONNECT_TIMEOUT", 15.0) if huaxin_server else 15.0
+    )
+    huaxin_xmd_command_timeout = (
+        get_env_float("HUAXIN_XMD_COMMAND_TIMEOUT", 5.0) if huaxin_server else 5.0
+    )
+    huaxin_xmd_snapshot_timeout = (
+        get_env_float("HUAXIN_XMD_SNAPSHOT_TIMEOUT", 5.0) if huaxin_server else 5.0
+    )
 
-    accounts_map = _parse_accounts(getattr(args, "accounts", None) or get_env("QMT_SERVER_ACCOUNTS"))
-    default_account_id = get_env("QMT_ACCOUNT_ID")
-    default_account_type = get_env("QMT_ACCOUNT_TYPE", "stock")
-    default_data_path = get_env("QMT_DATA_PATH")
+    accounts_map = _parse_accounts(
+        getattr(args, "accounts", None) or get_env("QMT_SERVER_ACCOUNTS")
+    )
+    if huaxin_server:
+        default_account_id = get_env("HUAXIN_ACCOUNT_ID") or get_env("QMT_ACCOUNT_ID")
+        default_account_type = get_env("HUAXIN_ACCOUNT_TYPE", "stock")
+        default_data_path = None
+    else:
+        default_account_id = get_env("QMT_ACCOUNT_ID")
+        default_account_type = get_env("QMT_ACCOUNT_TYPE", "stock")
+        default_data_path = get_env("QMT_DATA_PATH")
     if default_account_id and "default" not in accounts_map:
         accounts_map["default"] = AccountConfig(
             key="default",
             account_id=default_account_id,
             account_type=default_account_type or "stock",
             data_path=default_data_path,
-            session_id=get_env_int("QMT_SESSION_ID", 0) or None,
-            auto_subscribe=get_env_optional_bool("QMT_AUTO_SUBSCRIBE"),
+            session_id=None if huaxin_server else get_env_int("QMT_SESSION_ID", 0) or None,
+            auto_subscribe=(None if huaxin_server else get_env_optional_bool("QMT_AUTO_SUBSCRIBE")),
         )
     # Propagate default data path/session_id to entries lacking them
     for cfg in accounts_map.values():
+        if huaxin_server:
+            continue
         if not cfg.data_path:
             cfg.data_path = default_data_path
         if cfg.session_id is None:
@@ -262,7 +362,6 @@ def build_server_config(args) -> ServerConfig:
         log_account_snapshot=bool(log_account_snapshot),
         access_log_enabled=bool(access_log_enabled),
         order_risk_enabled=bool(order_risk_enabled),
-        idempotency_ttl_seconds=max(0, int(idempotency_ttl_seconds)),
         strategy_database_path=strategy_database_path,
         strategy_trading_enabled=get_env_bool("QMT_STRATEGY_TRADING_ENABLED", False),
         strategy_enabled_ids=list(dict.fromkeys(
@@ -286,6 +385,16 @@ def build_server_config(args) -> ServerConfig:
         dashboard_sample_interval_seconds=max(
             15, get_env_int("QMT_DASHBOARD_SAMPLE_INTERVAL_SECONDS", 60)
         ),
+        idempotency_max_entries=idempotency_max_entries,
+        huaxin_xmd_backend=huaxin_xmd_backend,
+        huaxin_xmd_python=huaxin_xmd_python,
+        huaxin_xmd_sdk_dir=huaxin_xmd_sdk_dir,
+        huaxin_xmd_front=huaxin_xmd_front,
+        huaxin_xmd_max_age_seconds=float(huaxin_xmd_max_age_seconds),
+        huaxin_xmd_simulation_replay=bool(huaxin_xmd_simulation_replay),
+        huaxin_xmd_connect_timeout=float(huaxin_xmd_connect_timeout),
+        huaxin_xmd_command_timeout=float(huaxin_xmd_command_timeout),
+        huaxin_xmd_snapshot_timeout=float(huaxin_xmd_snapshot_timeout),
     )
     if cfg.dashboard_enabled:
         if not cfg.strategy_database_path:

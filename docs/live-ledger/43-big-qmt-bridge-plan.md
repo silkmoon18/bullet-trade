@@ -31,3 +31,13 @@
 - 已读取项目边界规则，检查工作区，fetch 官方上游和标签。
 - 上游最新为 Beta 3；本机现有 main 分叉较多，采用显式 merge 而非覆盖源码或强制重置。
 - 待记录：切片结果、测试计数、冲突决策与未完成项。
+
+### S0 / S1 审查
+
+- S0：`8512457` 保存独立 QMT 版本，65 项原生/回测测试通过；账户配置已清空，私有备份未提交。
+- S1：12 项冲突逐项处理；JQ helper 与 `strategies/joinquant/` 相对提交前无代码差异。保留 fork StrategyLedger、看板、双账户、费用已知标志，合入上游行情/交易/生命周期修复。
+- 合并修正：类型声明补上上游可选参数；GBK 测试兼容 CRLF；远程客户端保留 broker_called=false 的明确拒单证据，未知提交异常不再被 TimeoutError 分支改写成客户端超时。未恢复上游完整接管 helper（与 fork API 不兼容）。
+- 1863 项回归通过：服务器/账本/大QMT、JQ运行时/原生执行/选股、类型与导出、原生QMT及合并契约。
+- 扩展 core/unit 全量收集遇到三项外部私有模块缺失：test_live_engine.py、test_formal_runtime_retry.py、test_v2_bridge.py 依赖仓外 strategies/bt_strategies；不伪造依赖或宣称全套通过。
+- 上游不再使用 broker RPC 的 TTL 淘汰，保留进程内稳定幂等与容量限制；fork 的策略目标持久幂等不变。
+- 下一切片只增加可选桥接传输，保留上游 HTTP 大 QMT 后端作为兼容路径。

@@ -8,6 +8,8 @@
 """
 
 import asyncio
+import contextvars
+import functools
 from typing import Callable, Optional, Dict, List, Any, Tuple, Sequence
 from datetime import date, datetime, time as Time
 from dataclasses import dataclass, field
@@ -197,7 +199,7 @@ class AsyncScheduleTask:
             # 跳过策略：如果正在执行，跳过本次
             if self._running:
                 logger.warning(
-                    f"⏭️  任务 {self.task_id} 正在执行，跳过本次调度"
+                    f"任务 {self.task_id} 正在执行，跳过本次调度"
                 )
                 return None
             
@@ -206,20 +208,20 @@ class AsyncScheduleTask:
                 async with self._lock:
                     return await self._do_execute(*args, **kwargs)
             else:
-                logger.warning(f"⏭️  任务 {self.task_id} 锁定中，跳过")
+                logger.warning(f"任务 {self.task_id} 锁定中，跳过")
                 return None
         
         elif self.overlap_strategy == OverlapStrategy.WAIT:
             # 等待策略：等待上次执行完成
             async with self._lock:
                 if self._running:
-                    logger.info(f"⏳ 任务 {self.task_id} 等待上次执行完成...")
+                    logger.info(f"任务 {self.task_id} 等待上次执行完成...")
                 return await self._do_execute(*args, **kwargs)
         
         elif self.overlap_strategy == OverlapStrategy.CONCURRENT:
             # 并发策略：允许同时执行多个实例
             logger.warning(
-                f"⚠️  任务 {self.task_id} 允许并发执行，注意竞态条件！"
+                f"任务 {self.task_id} 允许并发执行，注意竞态条件！"
             )
             return await self._do_execute(*args, **kwargs)
     
@@ -238,7 +240,7 @@ class AsyncScheduleTask:
         start_time = datetime.now()
         
         try:
-            logger.debug(f"▶️  执行任务: {self.task_id}")
+            logger.debug(f"执行任务: {self.task_id}")
             
             # 检查函数类型并执行
             if asyncio.iscoroutinefunction(self.func):
@@ -247,21 +249,30 @@ class AsyncScheduleTask:
             else:
                 # 同步函数：在线程池中执行
                 loop = asyncio.get_event_loop()
-                result = await loop.run_in_executor(None, self.func, *args, **kwargs)
+                # 显式传播 ContextVar，确保安全调度批次等调用上下文不会
+                # 在线程池边界丢失；partial 同时保留关键字参数兼容。
+                call_context = contextvars.copy_context()
+                call = functools.partial(
+                    call_context.run,
+                    self.func,
+                    *args,
+                    **kwargs,
+                )
+                result = await loop.run_in_executor(None, call)
             
             self._run_count += 1
             self._last_run = datetime.now()
             
             duration = (datetime.now() - start_time).total_seconds()
             logger.debug(
-                f"✅ 任务完成: {self.task_id} "
+                f"任务完成: {self.task_id} "
                 f"(耗时: {duration:.3f}s, 执行次数: {self._run_count})"
             )
             
             return result
             
         except Exception as e:
-            logger.error(f"❌ 任务执行失败: {self.task_id} - {e}", exc_info=True)
+            logger.error(f"任务执行失败: {self.task_id} - {e}", exc_info=True)
             raise
         finally:
             self._running = False
@@ -437,14 +448,14 @@ class AsyncScheduler:
         """
         # 检查是否已存在
         if task.task_id in self._task_map:
-            logger.warning(f"⚠️  任务 {task.task_id} 已存在，将被覆盖")
+            logger.warning(f"任务 {task.task_id} 已存在，将被覆盖")
             self.unschedule(task.task_id)
         
         self._tasks.append(task)
         self._task_map[task.task_id] = task
 
         logger.info(
-            f"✅ 已注册定时任务: {task.task_id} "
+            f"已注册定时任务: {task.task_id} "
             f"({self._format_schedule_description(task)})"
         )
         
@@ -485,22 +496,22 @@ class AsyncScheduler:
             task = self._task_map[task_id]
             self._tasks.remove(task)
             del self._task_map[task_id]
-            logger.info(f"🗑️  取消任务: {task_id}")
+            logger.info(f"取消任务: {task_id}")
         else:
-            logger.warning(f"⚠️  任务不存在: {task_id}")
+            logger.warning(f"任务不存在: {task_id}")
     
     def unschedule_all(self):
         """取消所有任务"""
         count = len(self._tasks)
         self._tasks.clear()
         self._task_map.clear()
-        logger.info(f"🗑️  已取消所有任务（共 {count} 个）")
+        logger.info(f"已取消所有任务（共 {count} 个）")
     
     def enable_task(self, task_id: str):
         """启用任务"""
         if task_id in self._task_map:
             self._task_map[task_id].enabled = True
-            logger.info(f"✅ 启用任务: {task_id}")
+            logger.info(f"启用任务: {task_id}")
             self._schedule_cache_date = None
             self._schedule_cache = {}
     
@@ -508,7 +519,7 @@ class AsyncScheduler:
         """禁用任务"""
         if task_id in self._task_map:
             self._task_map[task_id].enabled = False
-            logger.info(f"🔇 禁用任务: {task_id}")
+            logger.info(f"禁用任务: {task_id}")
             self._schedule_cache_date = None
             self._schedule_cache = {}
     
@@ -552,7 +563,7 @@ class AsyncScheduler:
             return results
         
         logger.debug(
-            f"⏰ {current_dt.strftime('%Y-%m-%d %H:%M:%S')} "
+            f"{current_dt.strftime('%Y-%m-%d %H:%M:%S')} "
             f"触发 {len(tasks_to_run)} 个任务"
         )
         
@@ -568,7 +579,7 @@ class AsyncScheduler:
                 # 打印堆栈，便于定位任务内部异常
                 tb = ''.join(traceback.format_exception(type(result), result, result.__traceback__))
                 logger.error(
-                    f"❌ 任务 {task.task_id} 执行异常: {result}\n{tb}",
+                    f"任务 {task.task_id} 执行异常: {result}\n{tb}",
                     exc_info=(type(result), result, result.__traceback__)
                 )
                 results[task.task_id] = {'error': str(result), 'traceback': tb}

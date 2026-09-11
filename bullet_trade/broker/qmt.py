@@ -207,7 +207,7 @@ class QmtBroker(BrokerBase):
 
         self._xt_imported = True
         session_id = self._session_id or int(time.time() * 1000)
-        self._session_id = session_id
+        self._session_id = max(session_id + 1, int(time.time() * 1000))
         trader = None
         callback = None
         account = None
@@ -663,6 +663,7 @@ class QmtBroker(BrokerBase):
         remark: Optional[str] = None,
         *,
         market: bool = False,
+        extra: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
         买入（支持按数量拆单 + 同步/异步等待骨架）。
@@ -670,6 +671,7 @@ class QmtBroker(BrokerBase):
         - TRADE_MAX_WAIT_TIME>0 视为同步等待，=0 异步立即返回；
         实际下单需接入 xtquant 后实现 _send_order。
         """
+        _ = extra
         self._ensure_connected()
         if amount <= 0:
             raise ValueError("买入数量必须为正")
@@ -694,11 +696,13 @@ class QmtBroker(BrokerBase):
         remark: Optional[str] = None,
         *,
         market: bool = False,
+        extra: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
         卖出（支持按数量拆单 + 同步/异步等待骨架）。
         实际下单需接入 xtquant 后实现 _send_order。
         """
+        _ = extra
         self._ensure_connected()
         if amount <= 0:
             raise ValueError("卖出数量必须为正")

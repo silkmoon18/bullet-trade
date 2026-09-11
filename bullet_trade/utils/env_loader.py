@@ -178,6 +178,7 @@ def get_data_provider_config() -> dict:
             "data_dir": get_env("QMT_DATA_PATH"),
             "auto_download": get_env_optional_bool("MINIQMT_AUTO_DOWNLOAD"),
             "market": get_env("MINIQMT_MARKET"),
+            "max_live_age_seconds": get_env_float("MINIQMT_LIVE_MAX_AGE_SECONDS", 5.0),
             "cache_dir": cache_dir_for("miniqmt"),
             "tushare_token": get_env("TUSHARE_TOKEN"),
             "tushare_custom_url": get_env("TUSHARE_CUSTOM_URL"),
@@ -230,6 +231,14 @@ def get_broker_config() -> dict:
             "tls_cert": get_env("QMT_SERVER_TLS_CERT"),
             "account_key": get_env("QMT_SERVER_ACCOUNT_KEY"),
             "sub_account_id": get_env("QMT_SERVER_SUB_ACCOUNT"),
+        },
+        "huaxin": {
+            "account_id": get_env("HUAXIN_ACCOUNT_ID"),
+            "account_type": get_env("HUAXIN_ACCOUNT_TYPE", "stock"),
+            "bundle_path": get_env("HUAXIN_NATIVE_BUNDLE"),
+            "runtime_mode": get_env("HUAXIN_RUNTIME_MODE", "server"),
+            "enable_trading": get_env_bool("HUAXIN_ENABLE_TRADING", False),
+            "enable_cancel": get_env_bool("HUAXIN_ENABLE_CANCEL", False),
         },
     }
 
@@ -295,6 +304,8 @@ def get_live_trade_config() -> dict:
 
     - event_time_out: 策略事件超时秒数（默认 60）
 
+    - fail_on_schedule_error: 调度任务返回错误时是否让 LiveEngine 异常退出（默认 False）
+
     - strategy_name: 策略名称（用于实盘订单备注标识，可选）
 
     - scheduler_market_periods: 交易时段覆写字符串（如 '09:30-11:30,13:00-15:00'）
@@ -321,6 +332,7 @@ def get_live_trade_config() -> dict:
         "order_max_volume": get_env_int("ORDER_MAX_VOLUME", 1_000_000),
         "trade_max_wait_time": get_env_int("TRADE_MAX_WAIT_TIME", 16),
         "event_time_out": get_env_int("EVENT_TIME_OUT", 60),
+        "fail_on_schedule_error": get_env_bool("BT_LIVE_FAIL_ON_SCHEDULE_ERROR", False),
         "strategy_name": get_env("STRATEGY_NAME"),
         "scheduler_market_periods": get_env("SCHEDULER_MARKET_PERIODS"),
         "account_sync_interval": get_env_int("ACCOUNT_SYNC_INTERVAL", 60),

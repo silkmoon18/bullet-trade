@@ -1,15 +1,25 @@
 # 配置总览
 
-这页分两层：
+这是一份按需查询的完整参考，不要求新用户复制全部配置。当前推荐的大 QMT 首次接入只需要三个服务端值；完成后即可停止阅读本页。
+
+```env
+QMT_SERVER_TOKEN=请生成一个新的客户端令牌
+QMT_ACCOUNT_ID=你的QMT资金账号
+BIG_QMT_GATEWAY_PASSWORD=与helper顶部完全一致
+```
+
+聚宽策略只填写 `host` 和 `token`；本地策略可直接复用这份 `.env.bigqmt`。完整步骤见 [大 QMT：两种接入方式](big-qmt-server.md)。
+
+其余内容分两层：
 
 - 前半部分是**最小可跑配置**，新机器先按这里配通。
 - 后半部分是**当前代码仍然生效的完整配置索引**。有默认值的不一定要写进 `.env`，但文档里必须能查到。
 
 没有列入这里的旧变量，通常表示当前代码没有读取，或者只是某个示例脚本里的 Python 常量，不再作为通用 `.env` 配置入口。
 
-## 1. 本地 QMT 最小配置
+## 1. MiniQMT 本地直连配置（兼容方案）
 
-适用场景：策略和 QMT 在同一台 Windows 机器上运行。
+适用场景：券商仍提供 MiniQMT/xtquant，且策略和 QMT 在同一台 Windows 机器上运行。新用户优先选择上面的大 QMT 路线。
 
 这是 MiniQMT/xtquant 直连模式，依赖 `QMT_DATA_PATH` 指向 `userdata_mini`。大 QMT 不能直接使用这组配置；大 QMT 先按 [大 QMT 服务向导](big-qmt-server.md) 启动 helper 和 `--server-type big_qmt`，策略侧再使用第 3 节的 `qmt-remote`。
 
@@ -141,7 +151,7 @@ QMT_SERVER_SUB_ACCOUNT=demo@main
 | --- | --- | --- |
 | `BT_ENV_FILE` / `BULLET_TRADE_ENV_FILE` / `ENV_FILE` | `./.env.live` | 显式指定要加载的 `.env` 文件；优先于自动向上查找 `.env`。 |
 | `DEFAULT_DATA_PROVIDER` | `jqdata` | 默认行情源：`jqdata`、`tushare`、`qmt`、`qmt-remote`、`rqdata`、`easy_tdx`。RQData/easy_tdx 仍为 Beta，需要显式启用。 |
-| `DEFAULT_BROKER` | `simulator` | 默认券商/交易通道：`simulator`、`qmt`、`qmt-remote`。 |
+| `DEFAULT_BROKER` | `simulator` | 默认券商/交易通道：`simulator`、`qmt`、`qmt-remote`、`huaxin`；远程华鑫策略通常仍选择 `qmt-remote`，由 server 使用 `huaxin` adapter。 |
 | `LOG_DIR` | `./logs` | 日志目录。 |
 | `LOG_LEVEL` | `INFO` | 控制台日志级别。 |
 | `LOG_FILE_LEVEL` | 跟随 `LOG_LEVEL` | 文件日志级别。 |
@@ -197,6 +207,7 @@ QMT_SERVER_SUB_ACCOUNT=demo@main
 | `QMT_SERVER_RPC_TIMEOUT` | `60` | 远程 QMT 客户端默认 RPC 超时，只保护网络响应，不代表等待成交时间。 |
 | `QMT_PLACE_ORDER_TIMEOUT_MARGIN` | `30` | 远程下单请求超时相对订单等待窗口的默认余量。 |
 | `EVENT_TIME_OUT` | `60` | 策略事件超时秒数。 |
+| `BT_LIVE_FAIL_ON_SCHEDULE_ERROR` | `false` | 调度任务报错时拒绝该批委托、锁死后续新委托并让 LiveEngine 异常退出；查询和已知订单撤单仍可执行。生产环境建议显式设为 `true`。 |
 | `STRATEGY_NAME` | 空 | 策略名称，用于订单备注和日志标识；未设置时通常用策略文件名。 |
 | `SCHEDULER_MARKET_PERIODS` | 空 | 覆盖交易时段，例如 `09:30-11:30,13:00-15:00`。 |
 | `ACCOUNT_SYNC_ENABLED` / `ACCOUNT_SYNC_INTERVAL` | `true` / `60` | 账户后台同步开关和间隔秒数。 |
@@ -257,9 +268,15 @@ QMT_SERVER_SUB_ACCOUNT=demo@main
 | `QMT_SERVER_LOG_ACCOUNT` | `false` | 是否打印账户快照。 |
 | `QMT_SERVER_ACCESS_LOG` | `true` | 是否启用访问日志。 |
 | `QMT_SERVER_ORDER_RISK_ENABLED` | `false` | 是否启用 server 端订单/撤单风控。 |
-| `QMT_SERVER_IDEMPOTENCY_TTL_SECONDS` | `300` | 下单幂等缓存窗口秒数，避免重试导致重复下单。 |
+| `QMT_SERVER_IDEMPOTENCY_MAX_ENTRIES` | `50000` | 进程内交易写幂等条目上限；达到上限后新 key 在券商调用前失败关闭，已有 key 仍可安全查询。 |
 | `QMT_SERVER_ACCOUNTS` | 空 | 多账户映射，例如 `main=123456,hedge=654321:future`。 |
 | `QMT_SERVER_SUB_ACCOUNTS` | 空 | 子账户映射，例如 `demo@main:limit=50000`。 |
+
+交易写必须携带稳定 `idempotency_key`。Server 在当前进程内原子占位并保留到进程结束；
+缓存不会按 TTL 或 LRU 淘汰，以免旧 key 被重新执行，但受 `QMT_SERVER_IDEMPOTENCY_MAX_ENTRIES`
+硬上限约束。达到上限后只拒绝新的写 key，拒绝发生在券商调用前；已有 key 的结果和冲突判断继续
+可用。应在确认所有在途/未知订单后选择维护窗口安全重启，而不是通过删除条目继续下单。进程重启后
+不承诺跨重启 exactly-once，提交结果未知时只允许用柜台订单/成交事实对账，禁止自动重发。
 
 ### 11.1 只读策略看板
 

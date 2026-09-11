@@ -1,19 +1,22 @@
 #encoding:gbk
 # Author: BruceLee
-# Date: 2026-07-02
-# Version: 20260703_miniqmt_alignment
-# File: Big QMT embedded gateway strategy sample.
-# Description: Run inside a dedicated Big QMT strategy and expose a
-# BulletTrade-compatible local HTTP/JSON data and trading gateway.
-# Big QMT embedded gateway strategy sample.
-# Run this file inside a dedicated Big QMT strategy to expose a local HTTP/JSON
-# bridge. Validate scheduling, thread boundaries and QMT API availability in a
-# simulation environment before production use.
+# Date: 2026-09-08
+# Version: 20260908_dividend_facts_v1
+# 职责：在大 QMT 内提供现有 HTTP 行情和交易桥接，以及完整除权事件事实。
+# 输入：HTTP 请求、ContextInfo 和下方现有账户/端口/认证配置。
+# 输出：兼容现有客户端的 JSON；除权事件同时保留旧字段及 QMT 原始七字段。
+# 上下游：由外部 BulletTrade 服务调用；复权计算留在 QMT 外，不在此修改策略公式。
+# 环境：源码必须保持 GBK，依赖 QMT 内置 Python/Tornado；仿真核验后再考虑生产。
 
+import calendar
+from datetime import datetime, timedelta, timezone
 import json
 import logging
+from logging.handlers import TimedRotatingFileHandler
+import math
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -41,7 +44,10 @@ LISTEN_PORT = 9000
 
 # Build marker shown in startup logs and /health. Update this when copying a new
 # helper build into QMT so tests can prove the running file version.
-GATEWAY_BUILD_ID = "20260703_miniqmt_alignment"
+GATEWAY_BUILD_ID = "20260908_dividend_facts_v1"
+
+# 除权事实协议版本；仅说明字段格式，不证明本地事件已下载完整或算法验收通过。
+DIVIDEND_EVENT_SCHEMA = "big-qmt-dividend-events/v1"
 
 # Shared password required by non-health HTTP APIs. Change this to a private
 # local value outside simulation; clients send it as X-BulletTrade-Password or
@@ -65,14 +71,8 @@ ACCOUNT_TYPE = "stock"
 # so use a stable liquid A-share as the equivalent market calendar anchor.
 DEFAULT_TRADE_DAYS_SECURITY = "000001.SZ"
 
-# Match MiniQMT's safety default: history reads first request QMT to prepare
-# local cache, then read local bars. Callers may pass auto_download=false only
-# for explicit diagnostics.
-AUTO_ENSURE_HISTORY_CACHE = True
-
-# When automatic history cache preparation fails, return an error instead of
-# reading potentially stale or placeholder local data.
-HISTORY_FAIL_ON_ENSURE_CACHE_ERROR = True
+# History reads always request QMT to download/refresh the matching local cache
+# before reading bars. This correctness rule cannot be disabled per request.
 
 # Match MiniQMT's index constituent semantics: prefer index-weight APIs over
 # sector lists. Sector list is only a fallback when the broker build lacks the
@@ -175,6 +175,9 @@ AUTO_START_HTTP_ON_MODULE_LOAD = False
 # Default per-request wait time when dispatching queued QMT actions.
 REQUEST_TIMEOUT_SECONDS = 10
 
+# Log a warning when one direct-dispatch QMT action exceeds this duration.
+SLOW_ACTION_WARNING_SECONDS = 5.0
+
 # Maximum accepted HTTP JSON body size in bytes.
 MAX_REQUEST_BODY_BYTES = 1024 * 1024
 
@@ -197,6 +200,19 @@ LOG_DIR = ""
 
 # Log file name created under LOG_DIR or the resolved default directory.
 LOG_FILE_NAME = "bt_big_qmt_gateway.log"
+
+# Rotate the helper log at local midnight. TimedRotatingFileHandler is part of
+# the Python 3.6 standard library and does not add a QMT whitelist dependency.
+LOG_ROTATE_WHEN = "midnight"
+
+# Rotate once per LOG_ROTATE_WHEN interval.
+LOG_ROTATE_INTERVAL = 1
+
+# Keep five completed daily log files in addition to the current active file.
+LOG_BACKUP_COUNT = 5
+
+# False means rotation follows the Windows/QMT machine local timezone.
+LOG_ROTATE_UTC = False
 
 
 def _boot_print(message: str) -> None:
@@ -241,16 +257,41 @@ def _setup_logger() -> logging.Logger:
     logger.setLevel(LOG_LEVEL)
     formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
     file_exists = False
-    for handler in logger.handlers:
+    for handler in list(logger.handlers):
         if getattr(handler, "baseFilename", None) == LOG_FILE:
-            file_exists = True
-            handler.setLevel(LOG_LEVEL)
-            handler.setFormatter(formatter)
+            if isinstance(handler, TimedRotatingFileHandler):
+                file_exists = True
+                handler.backupCount = LOG_BACKUP_COUNT
+                handler.setLevel(LOG_LEVEL)
+                handler.setFormatter(formatter)
+            else:
+                # QMT may reload a strategy in the same interpreter. Replace a
+                # stale plain FileHandler so rotation takes effect immediately.
+                logger.removeHandler(handler)
+                try:
+                    handler.close()
+                except Exception:
+                    pass
     if not file_exists:
         try:
-            file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+            file_handler = TimedRotatingFileHandler(
+                LOG_FILE,
+                when=LOG_ROTATE_WHEN,
+                interval=LOG_ROTATE_INTERVAL,
+                backupCount=LOG_BACKUP_COUNT,
+                encoding="utf-8",
+                delay=True,
+                utc=LOG_ROTATE_UTC,
+            )
         except TypeError:
-            file_handler = logging.FileHandler(LOG_FILE)
+            file_handler = TimedRotatingFileHandler(
+                LOG_FILE,
+                when=LOG_ROTATE_WHEN,
+                interval=LOG_ROTATE_INTERVAL,
+                backupCount=LOG_BACKUP_COUNT,
+                delay=True,
+                utc=LOG_ROTATE_UTC,
+            )
         except Exception as exc:
             _boot_print("file logger disabled log_file=%s error=%s" % (LOG_FILE, exc))
             file_handler = None
@@ -291,8 +332,12 @@ def _emit(level: str, message: str, *args: Any) -> None:
 
 _emit(
     "info",
-    "logger ready log_file=%s cwd=%s file=%s",
+    "logger ready log_file=%s rotate=%s interval=%s backups=%s utc=%s cwd=%s file=%s",
     LOG_FILE,
+    LOG_ROTATE_WHEN,
+    LOG_ROTATE_INTERVAL,
+    LOG_BACKUP_COUNT,
+    LOG_ROTATE_UTC,
     os.getcwd(),
     globals().get("__file__", "<no __file__>"),
 )
@@ -464,7 +509,108 @@ def _tick_float(tick: Dict[str, Any], *keys: str) -> Optional[float]:
     return None
 
 
-def _enrich_tick(context_info: Any, qmt_security: str, tick: Any) -> Dict[str, Any]:
+def _timestamp_epoch(value: Any) -> Optional[float]:
+    """把大 QMT 行情时间转换为可比较的 Unix 秒。
+
+    Args:
+        value: QMT timetag、epoch 秒/毫秒或带可选时区的时间文本。
+
+    Returns:
+        Optional[float]: 可验证的 Unix 秒；格式不受支持时返回 None。
+    """
+
+    if value in (None, "") or isinstance(value, bool):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    digits = text.replace(".", "", 1)
+    if text.isdigit() and len(text) in (14, 17):
+        try:
+            year = int(text[:4])
+        except Exception:
+            year = 0
+        if 2000 <= year <= 2100:
+            try:
+                return time.mktime(time.strptime(text[:14], "%Y%m%d%H%M%S"))
+            except Exception:
+                return None
+    if digits.isdigit():
+        try:
+            number = float(text)
+        except Exception:
+            number = 0.0
+        if number > 100000000000.0:
+            number /= 1000.0
+        if 946684800.0 <= number <= 4102444800.0:
+            return number
+
+    timezone_offset = None
+    if text.endswith("Z"):
+        timezone_offset = 0
+        text = text[:-1]
+    elif len(text) >= 6 and text[-6] in ("+", "-") and text[-3] == ":":
+        try:
+            sign = 1 if text[-6] == "+" else -1
+            timezone_offset = sign * (int(text[-5:-3]) * 3600 + int(text[-2:]) * 60)
+            text = text[:-6]
+        except Exception:
+            return None
+    for fmt in (
+        "%Y%m%d %H:%M:%S",
+        "%Y%m%d%H%M%S",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+    ):
+        try:
+            parsed = time.strptime(text, fmt)
+        except Exception:
+            continue
+        if timezone_offset is None:
+            return time.mktime(parsed)
+        return calendar.timegm(parsed) - timezone_offset
+    return None
+
+
+def _tick_age_seconds(source_time: Any, received_time: Any) -> Optional[float]:
+    """计算同一次行情查询中证券事件到接收完成的年龄。
+
+    Args:
+        source_time: QMT 快照携带的证券事件时间。
+        received_time: 本次 get_full_tick 查询完成时间。
+
+    Returns:
+        Optional[float]: 非负事件年龄秒数；任一时间不可解析时返回 None。
+    """
+
+    source_epoch = _timestamp_epoch(source_time)
+    received_epoch = _timestamp_epoch(received_time)
+    if source_epoch is None or received_epoch is None:
+        return None
+    age_seconds = received_epoch - source_epoch
+    if not math.isfinite(age_seconds) or age_seconds < 0.0:
+        return None
+    return age_seconds
+
+
+def _enrich_tick(
+    context_info: Any,
+    qmt_security: str,
+    tick: Any,
+    query_completed_time: Optional[str] = None,
+) -> Dict[str, Any]:
+    """补齐单证券快照的身份、时间、盘口和交易状态证据。
+
+    Args:
+        context_info: Big QMT 策略上下文。
+        qmt_security: QMT 格式证券代码。
+        tick: get_full_tick 返回的原始证券快照。
+        query_completed_time: 本次 get_full_tick 完成的北京时间。
+
+    Returns:
+        Dict[str, Any]: 保留原始字段并增加可选观察元数据的快照。
+    """
+
     item = _basic_value(tick)
     if not isinstance(item, dict):
         item = {"raw": item}
@@ -474,9 +620,41 @@ def _enrich_tick(context_info: Any, qmt_security: str, tick: Any) -> Dict[str, A
     last_price = _tick_float(item, "last_price", "lastPrice", "price")
     if last_price is not None:
         item.setdefault("last_price", last_price)
-    timetag = item.get("timetag") or item.get("time") or item.get("datetime")
+    timetag = (
+        item.get("timetag")
+        or item.get("time")
+        or item.get("datetime")
+        or item.get("source_time")
+    )
     if timetag not in (None, ""):
-        item.setdefault("dt", timetag)
+        item["dt"] = timetag
+        item["source_time"] = timetag
+    else:
+        item.pop("source_time", None)
+    item["source"] = "big_qmt_full_tick"
+    if query_completed_time:
+        item["received_time"] = query_completed_time
+        item["query_completed_time"] = query_completed_time
+        age_seconds = _tick_age_seconds(timetag, query_completed_time)
+        if age_seconds is not None:
+            item["age_seconds"] = age_seconds
+        else:
+            item.pop("age_seconds", None)
+    else:
+        item.pop("received_time", None)
+        item.pop("query_completed_time", None)
+        item.pop("age_seconds", None)
+    item["feed_health"] = {
+        "status": "healthy",
+        "query_succeeded": True,
+        "transport": "ContextInfo.get_full_tick",
+    }
+    bid_prices = item.get("bidPrice")
+    ask_prices = item.get("askPrice")
+    if item.get("bid_price1") in (None, "") and isinstance(bid_prices, (list, tuple)) and bid_prices:
+        item["bid_price1"] = _tick_float({"value": bid_prices[0]}, "value")
+    if item.get("ask_price1") in (None, "") and isinstance(ask_prices, (list, tuple)) and ask_prices:
+        item["ask_price1"] = _tick_float({"value": ask_prices[0]}, "value")
     getter = getattr(context_info, "get_instrument_detail", None)
     if getter is None:
         getter = getattr(context_info, "get_instrumentdetail", None)
@@ -509,12 +687,32 @@ def _enrich_tick(context_info: Any, qmt_security: str, tick: Any) -> Dict[str, A
     return item
 
 
-def _normalize_tick_keys(ticks: Any, context_info: Any = None) -> Dict[str, Any]:
+def _normalize_tick_keys(
+    ticks: Any,
+    context_info: Any = None,
+    query_completed_time: Optional[str] = None,
+) -> Dict[str, Any]:
+    """规范证券键并把同一次查询完成时间写入每条快照。
+
+    Args:
+        ticks: get_full_tick 返回的证券映射。
+        context_info: Big QMT 策略上下文。
+        query_completed_time: 本次查询完成的北京时间。
+
+    Returns:
+        Dict[str, Any]: 聚宽格式证券键到完整快照的映射。
+    """
+
     if not isinstance(ticks, dict):
         return {}
     normalized = {}
     for key, value in ticks.items():
-        normalized[_from_qmt_security(key)] = _enrich_tick(context_info, str(key), value)
+        normalized[_from_qmt_security(key)] = _enrich_tick(
+            context_info,
+            str(key),
+            value,
+            query_completed_time,
+        )
     return normalized
 
 
@@ -770,15 +968,48 @@ def _float_close(left: Any, right: Any) -> bool:
 
 
 def _order_matches_tag(row: Dict[str, Any], tag: Dict[str, Any]) -> bool:
+    """核对标签身份与订单事实；输入回报和标签，返回能否绑定，不修改状态。"""
+    row_key = str(row.get("qmt_user_order_id") or "").strip()
+    tag_key = str(tag.get("qmt_user_order_id") or "").strip()
+    raw = row.get("raw") if isinstance(row.get("raw"), dict) else {}
+    # 有客户键的提交必须由券商回显同一键，不能按经济字段合成强身份。
+    if bool(row_key) != bool(tag_key) or row_key != tag_key:
+        return False
+    if tag_key:
+        native_keys = [raw.get("qmt_user_order_id"), raw.get("m_strUserOrderId")]
+        if any(
+            str(value).strip() != tag_key
+            for value in native_keys if value not in (None, "")
+        ):
+            return False
+        remarks = [row.get("order_remark"), row.get("remark"), raw.get("m_strRemark")]
+        if any(
+            str(value or "").strip().startswith("BT-")
+            and str(value).strip() != tag_key
+            for value in remarks
+        ):
+            return False
+    row_sub = str(row.get("sub_account_id") or row.get("virtual_account_id") or "")
+    tag_sub = str(tag.get("sub_account_id") or tag.get("virtual_account_id") or "")
+    if row_sub and tag_sub and row_sub != tag_sub:
+        return False
+    row_side = str(row.get("side") or "").upper()
+    if not row_side:
+        row_side = {23: "BUY", 24: "SELL"}.get(raw.get("m_nOpType"), "")
+    if row_side and row_side != str(tag.get("side") or "").upper():
+        return False
     if str(row.get("security") or "") != str(tag.get("security") or ""):
         return False
     amount = int(row.get("amount") or 0)
     tag_amount = int(tag.get("amount") or 0)
     if tag_amount > 0 and amount != tag_amount:
         return False
+    # 强客户键对应同一次提交；市价保护价不是柜台生成价，不能参与身份比较。
+    exact_market = (row_key and tag_key and row_key == tag_key
+                    and int(tag.get("pr_type") or 11) != 11)
     tag_price = tag.get("price")
     order_price = row.get("order_price")
-    if tag_price not in (None, "") and order_price not in (None, "", 0, 0.0):
+    if not exact_market and tag_price not in (None, "") and order_price not in (None, "", 0, 0.0):
         if not _float_close(order_price, tag_price):
             return False
     order_epoch = _parse_order_epoch(row)
@@ -790,11 +1021,9 @@ def _order_matches_tag(row: Dict[str, Any], tag: Dict[str, Any]) -> bool:
 
 
 def _apply_order_tag(row: Dict[str, Any], tag: Dict[str, Any]) -> bool:
+    """补全业务标签但不生成客户键；输入已核验回报和标签，原地修改并返回是否变化。"""
     changed = False
     qmt_user_order_id = tag.get("qmt_user_order_id")
-    if qmt_user_order_id not in (None, "") and not row.get("qmt_user_order_id"):
-        row["qmt_user_order_id"] = qmt_user_order_id
-        changed = True
     for key in ("order_remark", "remark", "strategy_name", "sub_account_id", "virtual_account_id"):
         value = tag.get(key)
         current = row.get(key)
@@ -810,6 +1039,7 @@ def _apply_order_tag(row: Dict[str, Any], tag: Dict[str, Any]) -> bool:
 
 
 def _attach_virtual_tags_to_orders(orders: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """按双向唯一事实补标签；输入订单列表，返回原列表，必要时持久化标签映射。"""
     _load_order_tag_store_once()
     changed = False
     with ORDER_TAG_LOCK:
@@ -817,14 +1047,23 @@ def _attach_virtual_tags_to_orders(orders: List[Dict[str, Any]]) -> List[Dict[st
         for order in orders:
             order_id = str(order.get("order_id") or "").strip()
             tag = ORDER_TAGS_BY_ID.get(order_id) if order_id else None
+            # 已有绑定也不能遮蔽券商身份冲突或缺失，防止旧映射污染新回报。
+            if tag is not None and not _order_matches_tag(order, tag):
+                continue
             if tag is None:
-                for pending in reversed(PENDING_ORDER_TAGS):
-                    if _order_matches_tag(order, pending):
-                        tag = pending
+                candidates = [pending for pending in PENDING_ORDER_TAGS
+                              if _order_matches_tag(order, pending)]
+                if len(candidates) == 1:
+                    candidate = candidates[0]
+                    # 同一标签对应多个券商委托时不任选一单，也不覆盖已有绑定。
+                    matching_orders = [row for row in orders if _order_matches_tag(row, candidate)]
+                    bound_elsewhere = any(key != order_id and value == candidate
+                                          for key, value in ORDER_TAGS_BY_ID.items())
+                    if len(matching_orders) == 1 and not bound_elsewhere:
+                        tag = candidate
                         if order_id:
-                            ORDER_TAGS_BY_ID[order_id] = dict(pending)
+                            ORDER_TAGS_BY_ID[order_id] = dict(candidate)
                             changed = True
-                        break
             if tag is not None and _apply_order_tag(order, tag):
                 changed = True
         if changed:
@@ -849,21 +1088,32 @@ def _qmt_period(value: Any) -> str:
 
 
 def _qmt_dividend_type(value: Any) -> str:
-    text = str(value or "follow").strip().lower()
+    """归一化明确复权值；输入模式或 None，返回 QMT 字符串，非法值抛错，无外部副作用。
+
+    None 明确表示不复权；省略参数的旧 follow 默认由调用方处理，不能依赖真值判断。
+    """
+    if value is None:
+        return "none"
+    if not isinstance(value, str):
+        raise ValueError("复权模式必须为字符串或 None")
+    text = value.strip().lower()
     mapping = {
         "pre": "front_ratio",
         "post": "back_ratio",
         "qfq": "front_ratio",
         "hfq": "back_ratio",
         "none": "none",
-        "": "follow",
     }
-    return mapping.get(text, text)
+    result = mapping.get(text, text)
+    if result not in ("none", "front", "back", "front_ratio", "back_ratio", "follow"):
+        raise ValueError("不支持的复权模式")
+    return result
 
 
-def _date_digits(value: Any) -> str:
+def _date_digits(value: Any, max_length: int = 8) -> str:
     text = str(value or "")
     digits = "".join(ch for ch in text if ch.isdigit())
+    length = 14 if _to_int(max_length, 8) > 8 else 8
     if len(digits) >= 10 and not digits.startswith(("19", "20", "21")):
         try:
             timestamp = int(digits[:13] if len(digits) >= 13 else digits[:10])
@@ -872,10 +1122,11 @@ def _date_digits(value: Any) -> str:
             elif len(digits) > 10:
                 timestamp = int(digits)
                 timestamp = timestamp // 1000
-            return time.strftime("%Y%m%d", time.localtime(timestamp))
+            pattern = "%Y%m%d%H%M%S" if length > 8 else "%Y%m%d"
+            return time.strftime(pattern, time.localtime(timestamp))
         except Exception:
             pass
-    return digits[:8]
+    return digits[:length]
 
 
 def _date_in_range(value: Any, start: Any, end: Any) -> bool:
@@ -905,29 +1156,90 @@ def _is_miniqmt_fund_security(security: Any) -> bool:
     return len(code) == 6 and code.startswith("5")
 
 
+def _dividend_date(value: Any, label: str, allow_empty: bool = False) -> str:
+    """校验除权日期；输入日期值、字段名及空值许可，返回 ISO 日期，非法值抛 ValueError。
+
+    支持日/秒级日期文本和秒/毫秒时间戳；时间戳固定按中国时区解析，不依赖宿主机时区。
+    不访问 QMT，不改变共享的行情日期处理逻辑。
+    """
+    if value is None or value == "":
+        if allow_empty:
+            return ""
+        raise ValueError("%s 不能为空" % label)
+    if isinstance(value, bool):
+        raise ValueError("%s 不能是布尔值" % label)
+    text = str(value).strip()
+    formats = (
+        (r"[0-9]{8}", "%Y%m%d"),
+        (r"[0-9]{14}", "%Y%m%d%H%M%S"),
+        (r"[0-9]{4}-[0-9]{2}-[0-9]{2}", "%Y-%m-%d"),
+        (r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}", "%Y-%m-%dT%H:%M:%S"),
+        (r"[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}", "%Y-%m-%d %H:%M:%S"),
+    )
+    try:
+        for pattern, date_format in formats:
+            if re.fullmatch(pattern, text):
+                return datetime.strptime(text, date_format).date().isoformat()
+        if re.fullmatch(r"[0-9]{9,13}", text):
+            seconds = int(text) / (1000.0 if len(text) >= 11 else 1.0)
+            return datetime.fromtimestamp(seconds, timezone(timedelta(hours=8))).date().isoformat()
+    except (ValueError, OverflowError, OSError):
+        pass
+    raise ValueError("%s 不是有效日期" % label)
+
+
 def _split_dividend_row(qmt_security: str, template_security: Any, key: Any, item: Any) -> Dict[str, Any]:
-    values = list(item) if isinstance(item, (list, tuple)) else []
+    """转换单条 QMT 事件；输入证券、日期键与七项数组，返回兼容旧字段的完整事实字典。
 
-    def _number(index: int, default: float = 0.0) -> float:
+    缺失、非有限值或非法比例抛 ValueError，不补零、不访问网络、不生成累计因子。
+    送转负数保持原值供基金折算核对；原生 dr 仅用于诊断，不视为聚宽累计 factor。
+    """
+    event_date = _dividend_date(key, "事件日期")
+    names = ("interest", "stockBonus", "stockGift", "allotNum", "allotPrice", "gugai", "dr")
+    if not isinstance(item, (list, tuple)) or len(item) != len(names):
+        raise ValueError("%s 除权事件必须包含完整七字段" % event_date)
+    values = []
+    for index, name in enumerate(names):
         try:
-            return float(values[index] if index < len(values) else default)
-        except Exception:
-            return default
-
-    cash_dividend = _number(0)
-    bonus_share = _number(1)
-    transfer_share = _number(2)
-    rights_issue = _number(3)
+            if isinstance(item[index], bool) and name != "gugai":
+                raise ValueError("数值字段不能是布尔值")
+            number = float(item[index])
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError("%s 除权字段 %s 不是有效数值" % (event_date, name))
+        if not math.isfinite(number):
+            raise ValueError("%s 除权字段 %s 必须有限" % (event_date, name))
+        values.append(number)
+    cash_dividend, bonus_share, transfer_share, rights_issue, rights_price, gugai, dr = values
+    if cash_dividend < 0 or rights_issue < 0 or rights_price < 0:
+        raise ValueError("%s 现金、配股数量及配股价不能为负" % event_date)
+    scale_factor = 1.0 + bonus_share + transfer_share + rights_issue
+    if not math.isfinite(scale_factor) or scale_factor <= 0:
+        raise ValueError("%s 合并股本比例必须为正且有限" % event_date)
+    if gugai not in (0.0, 1.0):
+        raise ValueError("%s 股改标识不是已知的 0/1" % event_date)
+    if dr <= 0:
+        raise ValueError("%s QMT 原生除权系数必须为正" % event_date)
     is_fund = _is_miniqmt_fund_security(qmt_security)
     per_base = 1 if is_fund else 10
     bonus_pre_tax = cash_dividend if is_fund else cash_dividend * 10.0
+    if not math.isfinite(bonus_pre_tax):
+        raise ValueError("%s 兼容现金字段超出数值范围" % event_date)
     return {
         "security": _from_qmt_security(template_security or qmt_security),
-        "date": _date_iso(key),
+        "date": event_date,
         "security_type": "fund" if is_fund else "stock",
-        "scale_factor": float(1.0 + bonus_share + transfer_share + rights_issue),
+        "scale_factor": float(scale_factor),
         "bonus_pre_tax": float(bonus_pre_tax),
         "per_base": per_base,
+        "cash_per_share": cash_dividend,
+        "gift": bonus_share,
+        "transfer": transfer_share,
+        "rights": rights_issue,
+        "rights_price": rights_price,
+        "share_reform": gugai == 1.0,
+        "qmt_dr": dr,
+        "qmt_raw": dict(zip(names, values)),
+        "source_timestamp": str(key),
     }
 
 
@@ -984,15 +1296,42 @@ def _dataframe_to_payload(df: Any, include_index: bool = True) -> Dict[str, Any]
         return {"dtype": "dataframe", "columns": [], "records": []}
     try:
         columns = [str(col) for col in list(df.columns)]
-        has_named_index = bool(getattr(getattr(df, "index", None), "name", None))
-        raw = df.reset_index().values.tolist() if include_index and has_named_index else df.values.tolist()
-        if include_index and has_named_index:
-            columns = [str(df.index.name)] + columns
-        return {
+        data_rows = df.values.tolist()
+        index = getattr(df, "index", None)
+        index_name = getattr(index, "name", None)
+        index_type = type(index).__name__ if index is not None else ""
+        is_default_range = (
+            index_type == "RangeIndex"
+            and index_name is None
+            and getattr(index, "start", None) == 0
+            and getattr(index, "stop", None) == len(data_rows)
+            and getattr(index, "step", None) == 1
+        )
+        include_wire_index = bool(include_index and index is not None and not is_default_range)
+        index_values = list(index.tolist()) if include_wire_index else []
+        include_wire_index = include_wire_index and len(index_values) >= len(data_rows)
+        raw = data_rows
+        payload = {
             "dtype": "dataframe",
             "columns": columns,
-            "records": [[_basic_value(item) for item in row] for row in raw],
+            "records": [],
         }
+        if include_wire_index:
+            wire_name = str(index_name or "index")
+            if wire_name in columns:
+                wire_name = "__bt_index_0_1__"
+            payload["columns"] = [wire_name] + columns
+            raw = [[index_values[row_index]] + list(row) for row_index, row in enumerate(data_rows)]
+            payload.update(
+                {
+                    "index_columns": [wire_name],
+                    "index_names": [_basic_value(index_name)],
+                    "index_type": index_type or "Index",
+                    "index_dtypes": [str(getattr(index, "dtype", "object"))],
+                }
+            )
+        payload["records"] = [[_basic_value(item) for item in row] for row in raw]
+        return payload
     except Exception:
         return {"dtype": "dataframe", "columns": [], "records": []}
 
@@ -1003,6 +1342,10 @@ def _select_dataframe_columns(df: Any, fields: List[str]) -> Any:
         return df
     try:
         available = list(getattr(df, "columns", []))
+        if "money" in fields and "money" not in available and "amount" in available:
+            df = df.copy()
+            df["money"] = df["amount"]
+            available = list(getattr(df, "columns", []))
         selected = [field for field in fields if field in available]
         if selected:
             return df[selected]
@@ -1092,7 +1435,49 @@ def _account_to_dict(account: Any, account_id: str, account_type: str) -> Dict[s
     }
 
 
+def _finite_nonnegative_float(value: Any) -> Optional[float]:
+    """把字段转换为有限非负浮点数。
+
+    Args:
+        value: QMT 对象上的候选数值字段。
+
+    Returns:
+        Optional[float]: 有限非负值；负数、NaN、无穷或非法值返回 None。
+    """
+
+    try:
+        parsed = float(value)
+    except Exception:
+        return None
+    if not math.isfinite(parsed) or parsed < 0.0:
+        return None
+    return parsed
+
+
+def _position_average_cost(position: Any) -> float:
+    """选择大 QMT 持仓对象中语义可靠的平均建仓成本。
+
+    Args:
+        position: get_trade_detail_data 返回的持仓对象。
+
+    Returns:
+        float: 优先使用正数平均开仓价；在其为零、缺失或非法时回退有效开仓价，
+        均无效则为零。
+    """
+
+    zero_candidate = None
+    for field_name in ("m_dAvgOpenPrice", "m_dOpenPrice"):
+        parsed = _finite_nonnegative_float(getattr(position, field_name, None))
+        if parsed is None:
+            continue
+        if parsed > 0.0:
+            return parsed
+        zero_candidate = parsed
+    return float(zero_candidate or 0.0)
+
+
 def _position_to_dict(position: Any) -> Dict[str, Any]:
+    avg_cost = _position_average_cost(position)
     return {
         "security": _security(
             getattr(position, "m_strInstrumentID", ""),
@@ -1101,8 +1486,8 @@ def _position_to_dict(position: Any) -> Dict[str, Any]:
         "name": getattr(position, "m_strInstrumentName", ""),
         "amount": int(getattr(position, "m_nVolume", 0) or 0),
         "closeable_amount": int(getattr(position, "m_nCanUseVolume", 0) or 0),
-        "avg_cost": float(getattr(position, "m_dOpenPrice", 0.0) or 0.0),
-        "cost_basis": float(getattr(position, "m_dOpenPrice", 0.0) or 0.0),
+        "avg_cost": avg_cost,
+        "cost_basis": avg_cost,
         "market_value": float(getattr(position, "m_dMarketValue", 0.0) or 0.0),
         "last_price": float(getattr(position, "m_dLastPrice", 0.0) or 0.0),
         "frozen": int(getattr(position, "m_nFrozenVolume", 0) or 0),
@@ -1305,6 +1690,16 @@ def _query_trades(account_id: str, account_type: str, payload: Optional[Dict[str
 
 
 def _get_full_tick(context_info: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """查询实时快照并在 helper 边界记录独立的查询完成时间。
+
+    Args:
+        context_info: Big QMT 策略上下文。
+        payload: 含单证券或证券列表的 HTTP 请求载荷。
+
+    Returns:
+        Dict[str, Any]: 带完整 observation metadata 的 ticks 响应。
+    """
+
     securities = payload.get("securities") or payload.get("symbols")
     if not securities:
         securities = payload.get("stocks") or payload.get("codes")
@@ -1316,14 +1711,21 @@ def _get_full_tick(context_info: Any, payload: Dict[str, Any]) -> Dict[str, Any]
         return _context_not_ready(payload)
     ticks = context_info.get_full_tick(stock_code=qmt_codes) or {}
     source = "ContextInfo.get_full_tick"
-    return {"ticks": _normalize_tick_keys(ticks, context_info), "qmt_codes": qmt_codes, "source": source}
+    query_completed_time = time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime())
+    return {
+        "ticks": _normalize_tick_keys(ticks, context_info, query_completed_time),
+        "qmt_codes": qmt_codes,
+        "source": source,
+        "query_completed_time": query_completed_time,
+    }
 
 
 def _call_download_history_data(qmt_security: str, period: str, start: Any, end: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
     downloader = _qmt_global("download_history_data")
     incrementally = payload.get("incrementally")
-    start_text = str(start or "")
-    end_text = str(end or "")
+    date_length = 8 if period in ("1d", "1w", "1mon") else 14
+    start_text = _date_digits(start, date_length)
+    end_text = _date_digits(end, date_length)
     if incrementally is None:
         downloader(qmt_security, period, start_text, end_text)
     else:
@@ -1342,13 +1744,6 @@ def _call_download_history_data(qmt_security: str, period: str, start: Any, end:
 
 
 def _auto_ensure_history_cache(qmt_security: str, period: str, start: Any, end: Any, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    enabled = _payload_bool(
-        payload,
-        ["auto_download", "auto_ensure_cache", "ensure_cache"],
-        AUTO_ENSURE_HISTORY_CACHE,
-    )
-    if not enabled:
-        return None
     started = time.time()
     info = _call_download_history_data(qmt_security, period, start, end, payload)
     _emit(
@@ -1364,6 +1759,11 @@ def _auto_ensure_history_cache(qmt_security: str, period: str, start: Any, end: 
 
 
 def _query_history(context_info: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """读取现有历史行情；输入 QMT 上下文和请求，返回 JSON 成功或错误响应。
+
+    显式 fq（含 None）优先于 dividend_type；两者均省略时保留旧 follow 默认。
+    沿用原行情补缓存及读取流程，非法复权参数在补缓存前返回 BAD_REQUEST；不调用交易接口。
+    """
     security = payload.get("security")
     securities = payload.get("securities") or payload.get("symbols")
     if not security and securities:
@@ -1378,29 +1778,39 @@ def _query_history(context_info: Any, payload: Dict[str, Any]) -> Dict[str, Any]
     period = _qmt_period(payload.get("frequency") or payload.get("period") or "1d")
     start = payload.get("start") or payload.get("start_date") or payload.get("start_time") or ""
     end = payload.get("end") or payload.get("end_date") or payload.get("end_time") or ""
+    date_length = 8 if period in ("1d", "1w", "1mon") else 14
+    qmt_start = _date_digits(start, date_length)
+    qmt_end = _date_digits(end, date_length)
+    qmt_fields = []
+    for field in fields:
+        qmt_field = "amount" if field == "money" else field
+        if qmt_field not in qmt_fields:
+            qmt_fields.append(qmt_field)
     count = _to_int(payload.get("count"), -1)
-    dividend_type = _qmt_dividend_type(payload.get("fq") or payload.get("dividend_type"))
+    try:
+        mode = payload["fq"] if "fq" in payload else payload.get("dividend_type", "follow")
+        dividend_type = _qmt_dividend_type(mode)
+    except ValueError as exc:
+        return _error("BAD_REQUEST", str(exc), payload.get("request_id"))
     fill_data = _to_bool(payload.get("fill_data"), _to_bool(payload.get("fill_paused"), True))
     subscribe = _to_bool(payload.get("subscribe"), False)
     try:
         if context_info is None:
             return _context_not_ready(payload)
         try:
-            _auto_ensure_history_cache(qmt_security, period, start, end, payload)
+            _auto_ensure_history_cache(qmt_security, period, qmt_start, qmt_end, payload)
         except QmtApiUnavailable as exc:
             LOGGER.exception("history auto ensure_cache unavailable: %s", exc)
-            if HISTORY_FAIL_ON_ENSURE_CACHE_ERROR:
-                return _error("QMT_API_NOT_READY", str(exc), payload.get("request_id"))
+            return _error("QMT_API_NOT_READY", str(exc), payload.get("request_id"))
         except Exception as exc:
             LOGGER.exception("history auto ensure_cache failed: %s", exc)
-            if HISTORY_FAIL_ON_ENSURE_CACHE_ERROR:
-                return _error("ENSURE_CACHE_FAILED", str(exc), payload.get("request_id"))
+            return _error("ENSURE_CACHE_FAILED", str(exc), payload.get("request_id"))
         data = context_info.get_market_data_ex(
-            fields,
+            qmt_fields,
             [qmt_security],
             period=period,
-            start_time=str(start),
-            end_time=str(end),
+            start_time=qmt_start,
+            end_time=qmt_end,
             count=count,
             dividend_type=dividend_type,
             fill_data=fill_data,
@@ -1411,10 +1821,10 @@ def _query_history(context_info: Any, payload: Dict[str, Any]) -> Dict[str, Any]
             if df is None and data:
                 df = list(data.values())[0]
             df = _select_dataframe_columns(df, fields)
-            value = _normalize_history_payload(_dataframe_to_payload(df, include_index=False), security, period)
+            value = _normalize_history_payload(_dataframe_to_payload(df, include_index=True), security, period)
             return _ok(value, payload.get("request_id"))
         data = _select_dataframe_columns(data, fields)
-        value = _normalize_history_payload(_dataframe_to_payload(data, include_index=False), security, period)
+        value = _normalize_history_payload(_dataframe_to_payload(data, include_index=True), security, period)
         return _ok(value, payload.get("request_id"))
     except QmtApiUnavailable as exc:
         LOGGER.exception("get_market_data_ex unavailable: %s", exc)
@@ -1852,29 +2262,66 @@ def _query_index_stocks(context_info: Any, payload: Dict[str, Any]) -> Dict[str,
 
 
 def _query_split_dividend(context_info: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """查询完整除权事实；输入 QMT 上下文和请求，返回事件列表、来源和明确完整性边界。
+
+    仅调用单参数 get_divid_factors，并在本地筛日期；不下载、不订阅、不计算复权或交易。
+    API 失败与坏结构分开报错；空字典可返回空列表，但不能证明历史已完整。
+    """
     security = payload.get("security") or payload.get("stockcode")
     if not security:
         return _error("BAD_REQUEST", "get_split_dividend missing security", payload.get("request_id"))
     qmt_security = _to_qmt_security(security)
-    start = payload.get("start") or payload.get("start_date") or ""
-    end = payload.get("end") or payload.get("end_date") or ""
+    try:
+        start = _dividend_date(payload.get("start", payload.get("start_date")), "start", True)
+        end = _dividend_date(payload.get("end", payload.get("end_date")), "end", True)
+        if start and end and start > end:
+            raise ValueError("start 不能晚于 end")
+    except ValueError as exc:
+        return _error("BAD_REQUEST", str(exc), payload.get("request_id"))
     try:
         if context_info is None:
             return _context_not_ready(payload)
-        raw = context_info.get_divid_factors(qmt_security) or {}
-        events = []
-        for key in sorted(raw.keys()):
-            if not _date_in_range(key, start, end):
-                continue
-            item = raw.get(key)
-            events.append(_split_dividend_row(qmt_security, security, key, item))
-        return _ok({"events": events}, payload.get("request_id"))
+        getter = getattr(context_info, "get_divid_factors", None)
+        if not callable(getter):
+            raise QmtApiUnavailable("ContextInfo.get_divid_factors 不可用")
+        raw = getter(qmt_security)
     except QmtApiUnavailable as exc:
         LOGGER.exception("get_divid_factors unavailable: %s", exc)
         return _error("QMT_API_NOT_READY", str(exc), payload.get("request_id"))
     except Exception as exc:
         LOGGER.exception("get_divid_factors failed: %s", exc)
         return _error("SPLIT_DIVIDEND_FAILED", str(exc), payload.get("request_id"))
+    try:
+        if not isinstance(raw, dict):
+            raise ValueError("get_divid_factors 未返回明确字典，不能视为无事件")
+        dated = []
+        seen = set()
+        for key, item in raw.items():
+            event_date = _dividend_date(key, "事件日期")
+            if (start and event_date < start) or (end and event_date > end):
+                continue
+            if event_date in seen:
+                raise ValueError("%s 存在重复日期事件" % event_date)
+            seen.add(event_date)
+            dated.append((event_date, key, item))
+        events = [
+            _split_dividend_row(qmt_security, security, key, item)
+            for _, key, item in sorted(dated)
+        ]
+    except (ValueError, TypeError) as exc:
+        return _error("SPLIT_DIVIDEND_INVALID_DATA", str(exc), payload.get("request_id"))
+    return _ok(
+        {
+            "events": events,
+            "schema": DIVIDEND_EVENT_SCHEMA,
+            "source": "ContextInfo.get_divid_factors",
+            "gateway_build_id": GATEWAY_BUILD_ID,
+            "raw_event_count": len(raw),
+            "event_fields_complete": bool(events),
+            "history_completeness_verified": False,
+        },
+        payload.get("request_id"),
+    )
 
 
 def _call_passorder(
@@ -2446,6 +2893,8 @@ ACCOUNT_QUERY_ACTIONS = set(
 
 
 class _GatewayRuntime:
+    """协调 QMT 上下文、现有 HTTP 服务和请求队列；保留既有生命周期与交易调用边界。"""
+
     def __init__(self) -> None:
         self.context_info = None
         self.init_called = False
@@ -2458,8 +2907,19 @@ class _GatewayRuntime:
         self.ioloop = None
         self.http_thread = None
         self.direct_dispatch = False
+        self.current_action = None
+        self.current_request_id = None
+        self.current_action_started_at = None
+        self.last_action = None
+        self.last_action_request_id = None
+        self.last_action_elapsed_ms = None
+        self.last_action_finished_at = None
 
     def _dispatch_now(self, action: str, payload: Dict[str, Any], request_id: str) -> Dict[str, Any]:
+        started_at = time.time()
+        self.current_action = action
+        self.current_request_id = request_id
+        self.current_action_started_at = started_at
         try:
             _emit(
                 "info",
@@ -2469,15 +2929,11 @@ class _GatewayRuntime:
                 self.context_info is not None,
             )
             response = _dispatch_qmt_action(self.context_info, action, payload)
-            self.last_success_at = time.time()
-            _emit(
-                "info",
-                "dispatch done action=%s request_id=%s ok=%s code=%s",
-                action,
-                request_id,
-                response.get("ok"),
-                response.get("code") or "",
-            )
+            if response.get("ok"):
+                self.last_success_at = time.time()
+                self.last_error = None
+            else:
+                self.last_error = str(response.get("message") or response.get("code") or "")
             return response
         except Exception as exc:
             LOGGER.exception("direct dispatch failed: %s", exc)
@@ -2489,6 +2945,28 @@ class _GatewayRuntime:
                 "QMT_ACTION_FAILED",
                 "%s\n%s" % (exc, traceback.format_exc()),
                 request_id,
+            )
+        finally:
+            finished_at = time.time()
+            elapsed_ms = max(0.0, (finished_at - started_at) * 1000.0)
+            self.last_action = action
+            self.last_action_request_id = request_id
+            self.last_action_elapsed_ms = elapsed_ms
+            self.last_action_finished_at = finished_at
+            self.current_action = None
+            self.current_request_id = None
+            self.current_action_started_at = None
+            level = (
+                "warning"
+                if elapsed_ms >= max(0.0, SLOW_ACTION_WARNING_SECONDS * 1000.0)
+                else "info"
+            )
+            _emit(
+                level,
+                "dispatch done action=%s request_id=%s elapsed_ms=%.1f",
+                action,
+                request_id,
+                elapsed_ms,
             )
 
     def submit(self, action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -2549,17 +3027,23 @@ class _GatewayRuntime:
             job["event"].set()
 
     def health(self) -> Dict[str, Any]:
+        """返回运行与版本信息；无参数，输出健康字典，仅读取内存/日志文件状态，不启停服务。"""
+        now = time.time()
         context_ready = self.context_info is not None
         qmt_api_ready = _qmt_global_available("get_trade_detail_data")
         account_configured = not _is_placeholder_account_id(ACCOUNT_ID)
+        try:
+            log_file_size_bytes = os.path.getsize(LOG_FILE)
+        except Exception:
+            log_file_size_bytes = 0
         return {
-            "ready": context_ready or qmt_api_ready,
+            "ready": context_ready,
             "http_alive": self.ioloop is not None,
             "init_called": self.init_called,
             "context_ready": context_ready,
             "qmt_api_ready": qmt_api_ready,
             "data_context_ready": context_ready,
-            "trading_context_ready": context_ready,
+            "trading_context_ready": context_ready and account_configured and ENABLE_TRADING,
             "qmt_apis": {
                 "get_trade_detail_data": _qmt_global_available("get_trade_detail_data"),
                 "download_history_data": _qmt_global_available("download_history_data"),
@@ -2570,8 +3054,14 @@ class _GatewayRuntime:
             "backend_type": "big_qmt",
             "strategy": "bt_big_qmt_gateway",
             "gateway_build_id": GATEWAY_BUILD_ID,
+            "dividend_event_schema": DIVIDEND_EVENT_SCHEMA,
             "listen": "%s:%s" % (LISTEN_HOST, LISTEN_PORT),
             "log_file": LOG_FILE,
+            "log_file_size_bytes": log_file_size_bytes,
+            "log_rotate_when": LOG_ROTATE_WHEN,
+            "log_rotate_interval": LOG_ROTATE_INTERVAL,
+            "log_backup_count": LOG_BACKUP_COUNT,
+            "log_rotate_utc": LOG_ROTATE_UTC,
             "account_id": ACCOUNT_ID,
             "account_type": ACCOUNT_TYPE,
             "account_configured": account_configured,
@@ -2588,6 +3078,19 @@ class _GatewayRuntime:
             "stop_http_on_qmt_stop": STOP_HTTP_ON_QMT_STOP,
             "queue_size": self.request_queue.qsize(),
             "queue_max_size": MAX_QUEUE_SIZE,
+            "current_action": self.current_action,
+            "current_request_id": self.current_request_id,
+            "current_action_started_at": self.current_action_started_at,
+            "current_action_busy_ms": (
+                max(0.0, (now - self.current_action_started_at) * 1000.0)
+                if self.current_action_started_at is not None
+                else None
+            ),
+            "last_action": self.last_action,
+            "last_action_request_id": self.last_action_request_id,
+            "last_action_elapsed_ms": self.last_action_elapsed_ms,
+            "last_action_finished_at": self.last_action_finished_at,
+            "slow_action_warning_seconds": SLOW_ACTION_WARNING_SECONDS,
             "last_error": self.last_error,
             "last_success_at": self.last_success_at,
             "uptime_seconds": max(0.0, time.time() - self.started_at),
@@ -2631,6 +3134,7 @@ class _GatewayHandler(tornado.web.RequestHandler):
         self._handle_action(action, payload)
 
     def _handle_action(self, action: str, payload: Dict[str, Any]) -> None:
+        started_at = time.time()
         request_id = payload.get("request_id") or self._request_id()
         if not _check_password(self.request.headers):
             _emit("warning", "auth failed action=%s request_id=%s remote=%s", action, request_id, self.request.remote_ip)
@@ -2643,12 +3147,13 @@ class _GatewayHandler(tornado.web.RequestHandler):
             status = 404
         _emit(
             "info",
-            "http response action=%s request_id=%s status=%s ok=%s code=%s",
+            "http response action=%s request_id=%s status=%s ok=%s code=%s elapsed_ms=%.1f",
             action,
             request_id,
             status,
             response.get("ok"),
             response.get("code") or "",
+            max(0.0, (time.time() - started_at) * 1000.0),
         )
         self._send_json(status, response)
 
